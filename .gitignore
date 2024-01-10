@@ -1,0 +1,16 @@
+# RStudio project files
+*.Rproj
+.Rproj.user
+
+# Results
+results.xlsx
+figures
+
+# Data
+mice_uniovi.rds
+mice_lehallier.rds
+/Disease_Ontology
+/ELISAs_validation
+
+# First version of script
+clock.R

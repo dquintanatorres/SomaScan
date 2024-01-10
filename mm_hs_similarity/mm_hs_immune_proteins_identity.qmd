@@ -1,0 +1,354 @@
+---
+title: "Mouse-human immune-related proteins identity"
+author: "Diego Quintana Torres"
+format: html
+editor: visual
+---
+
+```{r}
+library("SomaDataIO")
+adat <- read.adat("~/SomaScan/SS-216926_SS-216925.hybNorm.medNormInt.plateScale.medNormSMP.adat")
+analytes <- getAnalyteInfo(adat)
+```
+
+```{r message = FALSE}
+library("dplyr")
+library("magrittr")
+library("purrr")
+library("ggplot2")
+library("openxlsx")
+
+library("Biostrings")
+```
+
+```{r}
+path <- "/data/diego/genomes/homology_mouse_human/"
+
+mm_hs_homologies <- read.delim(paste0(path, "/HOM_MouseHumanSequence.txt"))
+
+mapping_summary <- mm_hs_homologies %>% 
+    dplyr::group_by(DB.Class.Key) %>% 
+    summarise(count = n()) %>% 
+    dplyr::filter(count > 1)   # to filter out genes without orthologs
+
+mm_hs_homologies <- mm_hs_homologies %>% 
+                        dplyr::filter(DB.Class.Key %in% mapping_summary$DB.Class.Key) %>% 
+                        dplyr::select(DB.Class.Key, Common.Organism.Name, Symbol, EntrezGene.ID) %>% 
+                        dplyr::mutate(across(Common.Organism.Name, \(x) stringr::str_replace(x, "mouse, laboratory", "mm")),
+                                      across(Common.Organism.Name, \(x) stringr::str_replace(x, "human", "hs")),
+                                      EntrezGene.ID = as.character(.$EntrezGene.ID)) %>% 
+                        dplyr::distinct(DB.Class.Key, Common.Organism.Name, .keep_all = TRUE) %>% 
+                        dplyr::rename(EntrezGene.Symbol = Symbol) %>% 
+                        tidyr::pivot_wider(names_from = Common.Organism.Name, values_from = c("EntrezGene.Symbol", "EntrezGene.ID")) 
+ 
+```
+
+```{r}
+path_mm_proteome <- "/data/diego/proteomes/mouse/UP000000589_10090.fasta.gz"
+path_hs_proteome <- "/data/diego/proteomes/human/UP000005640_9606.fasta.gz"
+
+mm_proteome <- readAAStringSet(path_mm_proteome)
+hs_proteome <- readAAStringSet(path_hs_proteome)
+
+mm_proteome <- data.frame(seq_name = names(mm_proteome), seq_mm = paste(mm_proteome))
+hs_proteome <- data.frame(seq_name = names(hs_proteome), seq_hs = paste(hs_proteome))
+
+mm_proteome$UniProt.ID_mm <- strsplit(mm_proteome$seq_name, split = "\\|") %>%
+                         map_chr(2) %>% 
+                         unlist()
+hs_proteome$UniProt.ID_hs <- strsplit(hs_proteome$seq_name, split = "\\|") %>%
+                         map_chr(2) %>% 
+                         unlist()
+
+mm_proteome <- mm_proteome %>% 
+                    dplyr::filter(stringr::str_detect(seq_name, "GN=")) %>% 
+                    dplyr::mutate(EntrezGene.Symbol_mm = gsub(".*GN=([^ ]+).*", "\\1", .$seq_name))
+
+```
+
+```{r}
+proteins <- analytes %>% 
+                dplyr::filter(EntrezGeneID != "", Type == "Protein") %>% 
+                dplyr::select(UniProt, EntrezGeneID, EntrezGeneSymbol) %>% 
+                dplyr::rename(UniProt.ID_hs = UniProt, EntrezGene.ID_hs = EntrezGeneID, EntrezGene.Symbol_hs = EntrezGeneSymbol) %>% 
+                tidyr::separate_rows(everything(), sep = "\\|") %>%  # divide multimers into constituent proteins
+                dplyr::distinct() # rm duplicates after splitting multimeric proteins
+
+proteins <- proteins %>%
+                dplyr::inner_join(hs_proteome[, -1], by = "UniProt.ID_hs") %>%
+                dplyr::inner_join(mm_hs_homologies[, c("DB.Class.Key", "EntrezGene.Symbol_mm",
+                                                       "EntrezGene.ID_mm", "EntrezGene.ID_hs")],
+                                  by = "EntrezGene.ID_hs") %>%
+                dplyr::inner_join(mm_proteome[, -1], by = "EntrezGene.Symbol_mm")
+```
+
+Ortholog pairs with several human genes mapping to one mouse gene have the same `DB.Class.Key` value. The pairs with one human gene mapping to several mouse genes do not have the same `DB.Class.Key` value. To fix the latter, we will assign to all the pairs for a certain human gene the first `DB.Class.Key` encountered in its pairs:
+
+```{r}
+ID_key_pairs <- proteins[!duplicated(proteins$EntrezGene.ID_hs), c("EntrezGene.ID_hs", "DB.Class.Key")]
+proteins$DB.Class.Key <- ID_key_pairs$DB.Class.Key[match(proteins$EntrezGene.ID_hs, ID_key_pairs$EntrezGene.ID_hs)]
+```
+
+We compute the pairwise alignment and the % sequence identity:
+
+```{r}
+alignment <- pairwiseAlignment(proteins$seq_hs, proteins$seq_mm)
+proteins$identity <- pid(alignment) # identity(%) = 100 * (identical positions) / (aligned positions + internal gap positions)
+```
+
+In order to avoid taking into account the same protein twice or more, we will collapse the % identity from groups of related pairs arising from mouse genes mapping to more than one human gene, and vice versa:
+
+```{r}
+hs_mm_protein_identity <- proteins %>% 
+                        dplyr::group_by(EntrezGene.Symbol_hs) %>% 
+                        summarise(identity_collapsed = median(identity))
+```
+
+We now read in the inflammation/immune-related genes:
+
+```{r}
+gmt_file <- "/data/diego/MSigDB/Homo_sapiens/GMTs/symbols/c2.cp.wikipathways.v2022.1.Hs.symbols.gmt"
+collection <- fgsea::gmtPathways(gmt_file)
+
+immune_gene_set <- collection$WP_OVERVIEW_OF_PROINFLAMMATORY_AND_PROFIBROTIC_MEDIATORS
+```
+
+```{r}
+hs_mm_protein_identity$group <- ifelse(hs_mm_protein_identity$EntrezGene.Symbol_hs %in% immune_gene_set, "Immune-related", "Other")
+table(hs_mm_protein_identity$group)
+sprintf("The median identity between mouse and human proteins is of %.1f %%", median(hs_mm_protein_identity$identity_collapsed))
+sprintf("The median identity between mouse and human proteins is of %.1f %% in the immune-related gene set",
+        median(hs_mm_protein_identity$identity_collapsed[hs_mm_protein_identity$group == "Immune-related"]))
+sprintf("The median identity between mouse and human proteins is of %.1f %% in the `other` gene set",
+        median(hs_mm_protein_identity$identity_collapsed[hs_mm_protein_identity$group == "Other"]))
+
+```
+
+When looking at the % identity distribution across groups:
+
+```{r}
+ggplot(hs_mm_protein_identity, aes(x = identity_collapsed)) +
+    geom_density(aes(fill = group), alpha = 0.3, linewidth = 1, bw = 5) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 15),
+          legend.position = c(0.2, 0.75),
+          legend.title = element_text(size = 15, face = "bold"),
+          legend.text = element_text(size = 15),
+          legend.background = element_rect(colour = "black"),
+          panel.grid.minor = element_blank()) +
+    xlab("Identity (%)") +
+    ylab("Density") +
+    labs(fill = "Gene set") +
+    coord_cartesian(xlim = c(0, 100)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 10))
+
+```
+
+```{r}
+ggplot(hs_mm_protein_identity, aes(x = group, y = identity_collapsed)) +
+    geom_violin(aes(fill = group), alpha = 0.3, show.legend = FALSE, draw_quantiles = 0.5) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 15),
+          axis.title = element_text(size = 17.5),
+          panel.grid.minor = element_blank()) +
+    xlab("Gene set") +
+    ylab("Identity (%)") +
+    coord_cartesian(ylim = c(0, 100)) 
+
+```
+
+To recover the list of genes:
+
+```{r}
+write.csv(immune_gene_set, "~/SomaScan/mm_hs_similarity/immune_related_genes.csv", quote = FALSE, row.names = FALSE)
+```
+
+```{r warning = FALSE}
+mice_uniovi <- readRDS("~/SomaScan/mice_uniovi.rds")
+mice_uniovi <- mice_uniovi[, !duplicated(names(mice_uniovi))] # rm duplicated genes (diff aptamers targeting same gene)
+mice_uniovi <- mice_uniovi[, names(mice_uniovi) != ""] # rm column with empty colname
+
+sample_info <- c("id", "genotype", "sex", "model", "cohort", "age", "dataset")
+
+affinity_test <- mice_uniovi %>% 
+                    dplyr::filter(genotype == "WT") %>%
+                    dplyr::select(!all_of(sample_info)) %>% 
+                    dplyr::summarise(across(everything(), function(x) log2(median(2^x)))) %>%
+                    tidyr::pivot_longer(cols = everything(), names_to = "genes", values_to = "log2medianRFU") %>% 
+                    dplyr::inner_join(hs_mm_protein_identity, by = c("genes" = "EntrezGene.Symbol_hs"))
+
+
+affinity_test %>% 
+  dplyr::arrange(desc(group)) %>% 
+  ggplot(aes(x = identity_collapsed, y = log2medianRFU)) +
+    geom_point(aes(color = group, alpha = group), size = 1, ) +
+    geom_smooth(method = "loess", se = FALSE) +
+    scale_alpha_manual(name = "group", values = c(1, 0.1)) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 15, face = "bold"),
+          legend.position = c(0.2, 0.85),
+          legend.title = element_text(size = 15, face = "bold"),
+          legend.text = element_text(size = 15),
+          legend.background = element_rect(colour = "black"),
+          panel.grid.minor = element_blank()) +
+    guides(color = guide_legend(title = "Gene set", override.aes = list(size = 3)), alpha = "none") +
+    xlab("Identity (%)") +
+    ylab("log2medianRFU") +
+    coord_cartesian(xlim = c(0, 100)) 
+
+```
+
+```{r}
+affinity_test %>% 
+  dplyr::arrange(desc(group)) %>% 
+  ggplot(aes(x = identity_collapsed, y = 2^log2medianRFU)) +
+    geom_point(aes(color = group, alpha = group), size = 1, ) +
+    geom_smooth(method = "loess", se = FALSE) +
+    scale_alpha_manual(name = "group", values = c(1, 0.1)) +
+    theme_bw() +
+    geom_hline(yintercept = 10000) +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 15, face = "bold"),
+          legend.position = c(0.2, 0.85),
+          legend.title = element_text(size = 15, face = "bold"),
+          legend.text = element_text(size = 15),
+          legend.background = element_rect(colour = "black"),
+          panel.grid.minor = element_blank()) +
+    guides(color = guide_legend(title = "Gene set", override.aes = list(size = 3)), alpha = "none") +
+    xlab("Identity (%)") +
+    ylab("medianRFU") +
+    coord_cartesian(xlim = c(0, 100)) 
+```
+
+```{r}
+ggplot(affinity_test, aes(x = group, y = log2medianRFU)) +
+    geom_violin(aes(fill = group), alpha = 0.3, show.legend = FALSE, draw_quantiles = 0.5,
+                trim = FALSE) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 15),
+          axis.title = element_text(size = 17.5),
+          panel.grid.minor = element_blank()) +
+    xlab("Gene set") +
+    ylab("log2medianRFU")
+```
+
+```{r}
+table(affinity_test$group)
+```
+
+```{r}
+affinity_test_var <- mice_uniovi %>% 
+                    as_tibble() %>% 
+                    dplyr::filter(genotype == "WT") %>%
+                    dplyr::select(!all_of(sample_info)) %>% 
+                    dplyr::summarise(across(everything(), function(x) sd(x)/median(x))) %>%
+                    tidyr::pivot_longer(cols = everything(), names_to = "genes", values_to = "Var_RFU") %>% 
+                    dplyr::inner_join(hs_mm_protein_identity, by = c("genes" = "EntrezGene.Symbol_hs"))
+
+
+affinity_test_var %>% 
+  dplyr::arrange(desc(group)) %>% 
+  ggplot(aes(x = identity_collapsed, y = Var_RFU)) +
+    geom_point(aes(color = group, alpha = group), size = 1, ) +
+    geom_smooth(method = "loess", se = FALSE) +
+    scale_alpha_manual(name = "group", values = c(1, 0.1)) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 15, face = "bold"),
+          legend.position = c(0.2, 0.85),
+          legend.title = element_text(size = 15, face = "bold"),
+          legend.text = element_text(size = 15),
+          legend.background = element_rect(colour = "black"),
+          panel.grid.minor = element_blank()) +
+    guides(color = guide_legend(title = "Gene set", override.aes = list(size = 3)), alpha = "none") +
+    xlab("Identity (%)") +
+    ylab("Var(RFU)") +
+    coord_cartesian(xlim = c(0, 100))
+  
+```
+
+```{r}
+
+affinity_test_var %>% 
+  dplyr::arrange(desc(group)) %>% 
+  ggplot(aes(x = identity_collapsed, y = log10(Var_RFU))) +
+    geom_point(aes(color = group, alpha = group), size = 1, ) +
+    geom_smooth(method = "loess", se = FALSE) +
+    scale_alpha_manual(name = "group", values = c(1, 0.1)) +
+    theme_bw() +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 15, face = "bold"),
+          legend.position = c(0.2, 0.85),
+          legend.title = element_text(size = 15, face = "bold"),
+          legend.text = element_text(size = 15),
+          legend.background = element_rect(colour = "black"),
+          panel.grid.minor = element_blank()) +
+    guides(color = guide_legend(title = "Gene set", override.aes = list(size = 3)), alpha = "none") +
+    xlab("Identity (%)") +
+    ylab("log10Var(RFU)") +
+    coord_cartesian(xlim = c(0, 100))
+
+```
+
+```{r}
+
+qc_groups <- read.xlsx("~/SomaScan/mm_hs_similarity/SomaLogic_7K_Mouse_Plasma_Signaling_Metrics_220926.xlsx")
+# qc_groups_unique <- qc_groups[!duplicated(qc_groups$Target), ]
+# affinity_test <- affinity_test %>% 
+#     dplyr::left_join(analytes[c("EntrezGeneSymbol", "Target")], by = join_by(genes == EntrezGeneSymbol), multiple = "first") %>% 
+#     dplyr::left_join(qc_groups, by = "Target")
+
+```
+
+```{r}
+# TODO: comprobar si aptámeros targeteando la misma proteína pertenecen a grupos cualitativos distintos -> a ojo parece que sí
+
+DE_SeqId <- tab %>% 
+    dplyr::select(SeqId, P.value.adj.KOvWT, P.value.adj.LAKI_KOvWT, P.value.adj.ZMPSTE_KOvWT) %>% 
+    dplyr::mutate(DE_KOvsWT = ifelse(P.value.adj.KOvWT <= 0.05, TRUE, FALSE),
+                  DE_LAKI = ifelse(P.value.adj.LAKI_KOvWT <= 0.05, TRUE, FALSE),
+                  DE_ZMPSTE = ifelse(P.value.adj.ZMPSTE_KOvWT <= 0.05, TRUE, FALSE)) %>% 
+    dplyr::select(SeqId, DE_KOvsWT, DE_LAKI, DE_ZMPSTE)
+
+
+qc_groups <- qc_groups %>% 
+    dplyr::left_join(analytes[c("EntrezGeneSymbol", "SeqId")], by ="SeqId") %>% 
+    dplyr::left_join(DE_SeqId, by = "SeqId") %>% 
+    dplyr::mutate(Group = ifelse(EntrezGeneSymbol %in% immune_gene_set, "Immune-related", "Other"),
+                  Quality = factor(Quality, levels = c("High", "Medium", "Low")))
+
+
+qc_groups %>% 
+    ggplot(aes(Group, fill = Quality)) +
+    geom_bar(position = "fill")
+
+```
+
+```{r}
+
+qc_groups %>% 
+    dplyr::filter(!is.na(DE_KOvsWT)) %>% 
+    ggplot(aes(DE_KOvsWT, fill = Quality)) +
+    geom_bar(position = "fill")
+
+```
+
+```{r}
+
+qc_groups %>% 
+    dplyr::filter(!is.na(DE_LAKI)) %>% 
+    ggplot(aes(DE_LAKI, fill = Quality)) +
+    geom_bar(position = "fill")
+
+```
+
+```{r}
+
+qc_groups %>% 
+    dplyr::filter(!is.na(DE_ZMPSTE)) %>% 
+    ggplot(aes(DE_ZMPSTE, fill = Quality)) +
+    geom_bar(position = "fill")
+
+```

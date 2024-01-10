@@ -1,0 +1,3495 @@
+---
+title: "Analysis of plasma proteome in LAKI/FACE mice"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: sandstone
+    code_folding: "show"
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(message = F, warning = F, dpi=500, out.width = "100%") # For formating cells
+options(scipen = 4, digits = 3)
+```
+
+## 0. Environment
+
+First, we load the packages we will use for the analysis.
+
+```{r message=FALSE, warning=FALSE}
+library(SomaDataIO) # Grants functions for reading SomaLogic ADAT files
+library(broom) # turns regression results into readable data frames
+library(purrr) # Loop over objects performing functions
+library(pheatmap) # Heatmaps
+library(clusterProfiler) # KEGG / Gene ontologies
+library(ggplot2) # Grants functions for advanced plot design
+library(dplyr) # Grants functions for working with tidy data
+library(tidyr) # Grants functions for working with tidy data
+library(tibble) # Grants functions for working with tidy data
+library(forcats) # Grants functions for working with tidy data
+library(openxlsx) # Write excel file with results
+library(factoextra) # We'll use it for PCA
+library(limma) # It has a function for removing batch effects
+library(org.Hs.eg.db) # Package with human gene information for KEGG/GO
+library(DT) # For printing nice tables
+library(ggpubr)
+library(ggsci)
+library(ComplexHeatmap)
+library(ggrepel)
+library(ggtext)
+library(stringr)
+library(gplots)
+library(rstatix)
+library(ggplotify)
+library(glmnet)
+library(coefplot)
+
+library(ggVennDiagram)
+
+
+
+library(readxl)
+
+colors <- list("LakiWT" = "#F4903E",
+               "LakiKO" = "#E7700D",
+               "ZmpsteWT" = "#8C77A6",
+               "ZmpsteKO" = "#65517B",
+               "WT" = "#60A0A9",
+               "KO" = "#477D85")
+
+
+plots <- list()
+```
+
+Then, we load the .adat files from SomaLogic.
+
+## 1. Data preparation
+
+```{r, cache=T}
+mice_uniovi <- read.adat("SS-216926_SS-216925.hybNorm.medNormInt.plateScale.medNormSMP.adat")
+
+mice_metadata <- readxl::read_xlsx("mice_metadata.xlsx") # metadata file with cohort groups
+
+# Export public version of the metadata
+mice_metadata %>% 
+    dplyr::select(-DOB, -DOD) %>% 
+    dplyr::mutate(model = ifelse(model == "laki", "lmna", "zmpste24"),
+                  genotype = ifelse(model == "lmna" & genotype == "KO", "KI", genotype)) %>% 
+    write.csv("metadata_public.csv", row.names = FALSE)
+
+mice_metadata$id <- as.character(mice_metadata$id)
+mice_metadata
+OUT <- createWorkbook() # Create a blank excel file
+```
+
+Next, we retrieve the metadata from aptamers.
+
+```{r paged.print=TRUE}
+
+analytes <- getAnalyteInfo(mice_uniovi) # to return the metadata of the aptamers to link the AptNames with proteins
+analytes          # this version of the assay (SomaScan Assay v4.1) should include 7596 analytes
+
+```
+
+The SomaScan assay includes a series of "special" aptamers:
+
+```{r}
+table(analytes$Type)
+```
+
+As we can see, 7523 of the 7596 aptamers correspond to protein-targeting aptamers. We will check the 27 Non-Human aptamers:
+
+```{r}
+analytes[analytes$Type == "Non-Human", ]
+```
+
+There are 3 aptamers targeting mouse proteins that we will include in our analysis and others that target proteins of no interest for us (e.g. GFP). We will exclude from further analysis those aptamers not targeting human proteins or not targeting mouse proteins in the "Non-Human" group. ADAMTS1 is now targeted by both the human and mouse aptamers, so we will only keep the mouse one.
+
+```{r}
+exclude <- analytes %>% 
+              dplyr::filter(EntrezGeneSymbol != "Adamts1") %>%    # only include the mouse aptamer (Adamts1)
+  # we are keeping only human/mouse proteins with non-empty gene symbol (e.g. target == Fc_MOUSE):
+              dplyr::filter(Type != "Protein" | (Type == "Non-Human" & Organism != "Mouse") | (EntrezGeneSymbol == "")) %>% 
+              dplyr::pull(AptName)
+
+mice_uniovi <- mice_uniovi %>% 
+                    dplyr::select(-all_of(exclude))
+
+is_seq <- function(.x) grepl("^seq\\.[0-9]{4}", .x)
+
+n_aptamers <- sum(is_seq(names(mice_uniovi)))
+n_proteins <- data.frame(AptName = names(mice_uniovi[is_seq(names(mice_uniovi))])) %>% 
+              dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>% 
+              dplyr::select(EntrezGeneSymbol) %>% 
+              dplyr::pull() %>% 
+              unique() %>% 
+              length()
+
+sprintf("We continue the analysis with data for %d aptamers", n_aptamers)
+
+sprintf("We continue the analysis with data for %d unique proteins", n_proteins)
+
+```
+
+Now, we prepare the data frames. We find in the column `SampleType` that buffer and calibrator samples weren't removed. Also, the SampleId has to be split into three columns since we have there the metainformation on the mice (id, sex and genotype).
+
+```{r}
+table(mice_uniovi$SampleType) # calibrator and buffer remain in the tables
+head(mice_uniovi$SampleId) # Example of sampleIds
+```
+
+We remove buffers and calibrators and break the `SampleId` column into three pieces. The `RMA` column contains a code for each of both projects: SS-216925 are LAKI, while SS-216926 are Zmpste24.
+
+```{r}
+
+
+sample_info <- c("id", "genotype", "sex", "model", "cohort", "age", "dataset")
+
+mice_uniovi <- mice_uniovi %>% 
+  dplyr::filter(SampleType == "Sample") %>%         # rm control samples
+  tidyr::separate(col = SampleId, into = c("id", "genotype", "sex"), sep = " ") %>% 
+  dplyr::inner_join(., mice_metadata[ , c("id", "cohort", "age")], by = "id") %>%
+  dplyr::mutate(model = ifelse(RMA == "SS-216926", "zmpste", "laki"),
+                genotype = factor(genotype, levels = c("WT", "KO")),
+                model = factor(model, levels = c("laki", "zmpste")),
+                dataset = "uniovi",
+                age = age/30.41) %>%      # 30.41 == average number of days per month
+  dplyr::select_if(names(.) %in% sample_info | is_seq(names(.))) %>% # to remove SomaScan metadata
+  dplyr::mutate_if(is_seq(names(.)), log2) # If the column name starts with seq.XXXX, transform it into log2
+```
+
+## 2. QC
+
+```{r}
+mice_uniovi %>% 
+  select_if(names(.) %in% c("id", "model") | is_seq(names(.))) %>% 
+  pivot_longer(cols = -c(id, model), names_to = "AptName", values_to = "log2RFU") %>%
+  ggplot(aes(x = id, y = log2RFU, color = model)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust  = 0.5, size = 7))
+```
+
+## 3. Correction of batches
+
+```{r}
+raw_signal <- as.matrix(t(mice_uniovi[,is_seq(names(mice_uniovi))]))
+design <- model.matrix(~0 + mice_uniovi$genotype)
+corrected_model_sex <- limma::removeBatchEffect(raw_signal,
+                                         design = design,
+                                         batch  = mice_uniovi$sex,
+                                         batch2 = mice_uniovi$model)
+```
+
+```{r}
+res.pca <- prcomp(t(corrected_model_sex),  scale = T)
+s1a <- fviz_pca_ind(res.pca, label="none", habillage=mice_uniovi$cohort, fill = mice_uniovi$cohort, invisible="quali", stroke = 2, pointsize = 2) + 
+  theme_bw() +
+  theme(axis.text = element_text(size = 8),
+        axis.title = element_text(size = 10),
+        legend.text = element_markdown(size = 10, margin = margin(r = 15, unit = "pt"), face = "bold"),
+        legend.title = element_text(face = "bold"),
+        legend.text.align = 0,
+        legend.position = "bottom",
+        panel.grid = element_blank(),
+        legend.direction = "vertical") +
+  guides(fill = guide_legend(ncol = 2),
+         shape = guide_legend(ncol = 2),
+         color = guide_legend(ncol = 2)) +
+  scale_color_npg(name = "Batch", labels = c("<i>Lmna</i> - 1", 
+                                             "<i>Lmna</i> - 2",
+                                             "<i>Zmpste24</i> - 3",
+                                             "<i>Zmpste24</i> - 4")) +
+  scale_shape_manual(name = "Batch", values = c(21, 24, 22, 3),
+                                       labels = c("<i>Lmna</i> - 1", 
+                                                  "<i>Lmna</i> - 2",
+                                                  "<i>Zmpste24</i> - 3",
+                                                  "<i>Zmpste24</i> - 4")) +
+  scale_fill_npg(name = "Batch", labels = c("<i>Lmna</i> - 1", 
+                                            "<i>Lmna</i> - 2",
+                                            "<i>Zmpste24</i> - 3",
+                                            "<i>Zmpste24</i> - 4")) +
+  ggtitle(NULL)
+
+```
+
+```{r}
+corrected_model_sex_cohort <- removeBatchEffect(corrected_model_sex,
+                                                design = design,
+                                                batch = mice_uniovi$cohort)
+
+
+
+## Correct cohort batch
+design <- model.matrix(~0 + mice_uniovi$genotype + mice_uniovi$sex)
+corrected_batch <- removeBatchEffect(raw_signal,
+                                         design = design,
+                                         batch  = mice_uniovi$cohort)
+mice_uniovi_corrected_batch <- as_tibble(t(corrected_batch)) %>% 
+                                mutate(genotype = mice_uniovi$genotype,
+                                       sex = mice_uniovi$sex,
+                                       model = mice_uniovi$model,
+                                       age = mice_uniovi$age,
+                                       cohort = mice_uniovi$cohort,
+                                       id = mice_uniovi$id,
+                                       dataset = mice_uniovi$dataset)
+
+## Correct cohort batch and sex
+design <- model.matrix(~0 + mice_uniovi$genotype)
+corrected_batch_sex <- removeBatchEffect(raw_signal,
+                                         design = design,
+                                         batch  = mice_uniovi$cohort,
+                                         batch2 = mice_uniovi$sex)
+
+
+mice_uniovi_corrected_batch_sex <- as_tibble(t(corrected_batch_sex)) %>% 
+                                mutate(genotype = mice_uniovi$genotype,
+                                       sex = mice_uniovi$sex,
+                                       model = mice_uniovi$model,
+                                       age = mice_uniovi$age,
+                                       cohort = mice_uniovi$cohort,
+                                       id = mice_uniovi$id,
+                                       dataset = mice_uniovi$dataset)
+
+```
+
+```{r}
+res.pca <- prcomp(t(corrected_model_sex_cohort),  scale = T) # Calculates PCA
+s1b <- fviz_pca_ind(res.pca, label="none",
+                       habillage = factor(interaction(mice_uniovi$genotype, mice_uniovi$model), levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                       fill =      factor(interaction(mice_uniovi$genotype, mice_uniovi$model), levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                       stroke = 2, pointsize = 2, invisible = "quali") + 
+          theme_bw() +
+          theme(axis.text = element_text(size = 8),
+                axis.title = element_text(size = 10),
+                legend.text = element_markdown(size = 10, margin = margin(r = 15, unit = "pt"), face = "bold"),
+                legend.title = element_text(face = "bold"),
+                legend.text.align = 0,
+                legend.position = "bottom",
+                legend.direction = "vertical",
+                panel.grid = element_blank()) +
+          guides(fill = guide_legend(ncol = 2),
+                 shape = guide_legend(ncol = 2),
+                 color = guide_legend(ncol = 2)) +
+          scale_color_manual(name = "Genotype",
+                             values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO),
+                                               c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                             labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                        "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                        "<i>Zmpste24<sup>+/+</sup></i>",
+                                        "<i>Zmpste24<sup>-/-</sup></i>")) +
+          scale_shape_manual(name = "Genotype",
+                             values = setNames(c(22, 22, 24, 24),
+                                               c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                             labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                        "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                        "<i>Zmpste24<sup>+/+</sup></i>",
+                                        "<i>Zmpste24<sup>-/-</sup></i>")) +
+          scale_fill_manual(name = "Genotype",
+                            values = setNames(c("white", colors$LakiKO, "white", colors$ZmpsteKO),
+                                              c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                            labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                        "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                        "<i>Zmpste24<sup>+/+</sup></i>",
+                                        "<i>Zmpste24<sup>-/-</sup></i>")) +
+          ggtitle(NULL)
+
+```
+
+```{r}
+# #Get legends
+# s1alegend <- s1a +
+#   theme_void() +
+#   lims(x = c(0,0), y = c(0,0)) +
+#   theme(legend.position = c(.5, .5),
+#         line = element_blank(),
+#         legend.text.align = 0) +
+#   guides(colour = guide_legend(override.aes = list(size = 5)))
+# 
+# s1blegend <- s1b +
+#   theme_void() +
+#   lims(x = c(0,0), y = c(0,0)) +
+#   theme(legend.position = c(.5, .5),
+#         line = element_blank(),
+#         legend.text.align = 0) +
+#   guides(colour = guide_legend(override.aes = list(size = 6))) 
+# 
+# # Remove intercepts
+# s1alegend$layers[[3]] <- NULL
+# s1alegend$layers[[2]] <- NULL
+# s1blegend$layers[[3]] <- NULL
+# s1blegend$layers[[2]] <- NULL
+
+```
+
+
+
+```{r}
+
+# Change in axes Dim with PC
+s1a$labels$x <- gsub("Dim", "PC", s1a$labels$x)
+s1a$labels$y <- gsub("Dim", "PC", s1a$labels$y)
+s1b$labels$x <- gsub("Dim", "PC", s1a$labels$x)
+s1b$labels$y <- gsub("Dim", "PC", s1a$labels$y)
+
+s1 <- ggarrange(s1a,
+                s1b,
+                labels = c("(a)", "(b)"), nrow = 1)
+
+plots$s1 <- s1
+
+ggsave("s1.pdf", plot = s1, device = "pdf", path = "figures/", height = 100, width = 180, units = "mm")
+
+```
+
+## 4. Limma model
+
+```{r}
+group_mice_uniovi <- glue::glue("{mice_uniovi$genotype}_{mice_uniovi$sex}_{mice_uniovi$model}")
+limma_design <- model.matrix(~ 0 + group_mice_uniovi) #Make the design: tell which are our variables of interest
+colnames(limma_design) <- gsub("group_mice_uniovi", "", colnames(limma_design))
+
+contrasts <- makeContrasts(
+  KOvWT=(KO_Female_laki+KO_Female_zmpste+KO_Male_laki+KO_Male_zmpste)/4-(WT_Female_laki+WT_Female_zmpste+WT_Male_laki+WT_Male_zmpste)/4,
+  LAKI_KOvWT=(KO_Female_laki+KO_Male_laki)/2-(WT_Female_laki+WT_Male_laki)/2,
+  ZMPSTE_KOvWT=(KO_Female_zmpste+KO_Male_zmpste)/2-(WT_Female_zmpste+WT_Male_zmpste)/2,
+  SEX_KOvWT=(KO_Male_zmpste+KO_Male_laki-WT_Male_zmpste-WT_Male_laki)/4-(KO_Female_zmpste+KO_Female_laki-WT_Female_zmpste-WT_Female_laki)/4,
+  SEX_LAKI_KOvWT=(KO_Male_laki-WT_Male_laki)/2-(KO_Female_laki-WT_Female_laki)/2,
+  SEX_ZMPSTE_KOvWT=(KO_Male_zmpste-WT_Male_zmpste)/2-(KO_Female_zmpste-WT_Female_zmpste)/2,
+  MODEL_KOvWT=(KO_Male_zmpste+KO_Female_zmpste-WT_Male_zmpste-WT_Female_zmpste)/4-(KO_Male_laki+KO_Female_laki-WT_Male_laki-WT_Female_laki)/4,
+  KOvsKO=(KO_Female_laki+KO_Male_laki)/2-(KO_Female_zmpste+KO_Male_zmpste)/2,
+  WTvsWT=(WT_Female_laki+WT_Male_laki)/2-(WT_Female_zmpste+WT_Male_zmpste)/2,
+
+  levels=colnames(limma_design))
+
+contrasts
+```
+
+```{r}
+counts <- t(mice_uniovi[,is_seq(names(mice_uniovi))])
+corfit <- duplicateCorrelation(counts, design, block=mice_uniovi$cohort)
+v <- voom(2^counts, design = limma_design, block = mice_uniovi$cohort, correlation=corfit$consensus)
+fit <- lmFit(v, design = limma_design, block=mice_uniovi$cohort, correlation=corfit$consensus)
+fit <- contrasts.fit(fit, contrasts)
+fit2 <- treat(fit, trend = F, robust =F, lfc = log2(1.05))
+results <- decideTests(fit2, method="separate")
+summary(results)
+```
+
+```{r}
+# The following is code obtained from the `write.fit` function, from `limma`.
+# It allows to obtain directly the complete table with all the results.
+# The only difference is that this function writes the table to a file, while I leave it stored in the R environment. 
+p.value <- as.matrix(fit2$p.value)
+p.value.adj <- p.value
+for (j in 1:ncol(p.value)) p.value.adj[, j] <- p.adjust(p.value[, j], method = "fdr")
+# F.p.value.adj <- p.adjust(fit2$F.p.value, method = "fdr")
+tab <- list()
+tab$AveExpr <- fit2$Amean
+tab$Coef <- drop(fit2$coefficients)
+tab$t <- drop(fit2$t)
+tab$P.value <- drop(p.value)
+tab$P.value.adj <- drop(p.value.adj)
+tab$Results <- drop(unclass(results))
+tab$Genes <- fit2$gene
+tab <- data.frame(tab, check.names = FALSE)
+row.names(tab) <- row.names(fit)
+
+
+
+tab <- tab %>% 
+  mutate(AptName = rownames(.)) %>% 
+  arrange(P.value.adj.KOvWT) %>% 
+  inner_join(., analytes[,c("AptName", "EntrezGeneID", "EntrezGeneSymbol", "SeqId",
+                            "Target", "UniProt")], by = "AptName")  # Append the gene names from the analyte data frame.
+
+addWorksheet(OUT, "DEG_limma") # New excel sheet
+writeData(OUT, sheet = "DEG_limma", x = tab, rowNames = F)
+
+```
+
+### 4.1. KO vs WT
+
+```{r}
+cols <- c("#83D1E2", "grey", "#EF8172")
+breaks <- seq(-2,2, 0.5)
+
+f1a <- tab %>% 
+  arrange(-abs(t.KOvWT)) %>% 
+  mutate(x = row_number(), 
+         top = ifelse(x < 16, EntrezGeneSymbol, "")) %>% 
+  ggplot(., aes(Coef.KOvWT, -log10(P.value.adj.KOvWT), alpha = -log10(P.value.adj.KOvWT), color = ifelse(P.value.adj.KOvWT > .05, "Not significant", ifelse(Coef.KOvWT > 0, "Upregulated", "Downregulated")))) +
+    scale_color_manual(values = cols) +
+    geom_text_repel(aes(label = top), box.padding = .3, color = "black", max.overlaps = Inf) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype = 2, color = "black") +
+    geom_abline(slope=0, intercept=-log10(0.05), linetype = 2, color = "black") +
+    scale_y_continuous(expand = c(0,0), limits = c(0, 12.5)) +
+    scale_x_continuous(expand = c(0,0), limits = c(-2, 2), breaks = breaks, labels = ifelse(breaks%%1 == 0, breaks, "")) +
+    theme_bw() +
+    theme(text = element_text(size = 8),
+          legend.position = "right",
+          panel.grid = element_blank(),
+          legend.text = element_text(size=10, face = "bold"),
+          axis.text = element_text(size = 8),
+          axis.title = element_text(size = 10)) +
+    ylab(expression(-log[10]*FDR)) +
+    xlab(expression(log[2]*FC)) +
+    labs(color = "") +
+    guides(alpha = "none", colour = guide_legend(override.aes = list(size = 5), hjust = 0)) 
+
+f1a
+```
+
+```{r}
+boxplot_genes <- tab %>% 
+                    dplyr::arrange(P.value.adj.KOvWT) %>% 
+                    dplyr::select(AptName, EntrezGeneSymbol) %>% 
+                    head(10)
+
+tmp <- mice_uniovi %>%
+  dplyr::select(all_of(c(boxplot_genes$AptName, "genotype"))) %>%
+  tidyr::pivot_longer(boxplot_genes$AptName, names_to = "AptName") %>%
+  dplyr::left_join(analytes[ , c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::left_join(tab[ , c("AptName", "P.value.adj.KOvWT")], by = "AptName") %>%
+  dplyr::group_by(AptName) %>% 
+  dplyr::mutate(y.position = 1.04 * max(value),
+                p.adj.signif = dplyr::case_when(P.value.adj.KOvWT <  0.0001 ~ "****",
+                                                P.value.adj.KOvWT <  0.001  ~ "***",
+                                                P.value.adj.KOvWT <  0.01   ~ "**",
+                                                P.value.adj.KOvWT <= 0.05   ~ "*",
+                                                P.value.adj.KOvWT >  0.05   ~ "ns")) %>% 
+  dplyr::ungroup()
+
+
+
+stat_significance <- tmp %>% 
+                        dplyr::filter(!duplicated(AptName)) %>% 
+                        dplyr::mutate(group1 = rep("WT", nrow(.)),
+                                      group2 = rep("KO", nrow(.)))
+
+f1b <- tmp %>% 
+  ggplot(aes(genotype, value, color = genotype)) +
+  geom_boxplot(aes(fill = genotype), outlier.shape = NA, alpha = 0.1) +
+  geom_point(aes(shape = genotype), stroke = 1.1, size = 0.9, position = position_jitterdodge(jitter.width = 0.75)) +
+  scale_color_manual(values = c(colors$WT, colors$KO), labels = c("Control", "Progeroid")) +
+  scale_fill_manual(values = c("white", colors$KO), labels = c("Control", "Progeroid")) +
+  scale_shape_manual(values = c("WT" = 1, "KO" = 19), labels = c("Control", "Progeroid")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free", ncol = 5) +
+  stat_pvalue_manual(stat_significance, label = "p.adj.signif", tip.length = 0.01, size = 5) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.position = "right",
+        text = element_text(size = 12.5),
+        legend.text=element_text(size=10, face = "bold"),
+        legend.title = element_blank(),
+        panel.spacing = unit(10, "points"),
+        strip.text = element_text(size = 8, face = "bold")) +
+  guides(color = guide_legend(label.hjust = 0))
+f1b
+```
+
+```{r}
+# boxplot_aptamers <- c(
+#                       "seq.20093.9", # VCAM1
+#                       "seq.2967.8",  # VCAM1
+#                       "seq.3350.53", # CAMK2A
+#                       "seq.3351.1",  # CAMK2B
+#                       "seq.3419.49", # CAMK2D
+#                       "seq.14685.17", # AKT2
+#                       "seq.15627.83", # AKT1
+#                       "seq.2867.52", # AKT1
+#                       "seq.3392.68", # AKT3
+#                       "seq.5360.9", # AKT2
+#                       "seq.25274.2", # ANKRD2
+#                       "seq.3037.62", # IL1B
+#                       "seq.9869.28", # NFKB1
+#                       "seq.21976.4", # IKBKG
+#                       "seq.2952.75", # IGF1
+#                       "seq.8406.17", # IGF1
+#                       "seq.2573.20", # IL6
+#                       "seq.4673.13", # IL6
+#                       "seq.21946.79", # IL6|IL6R
+#                       "seq.14587.16", # GDF11
+#                       "seq.2765.4", # GDF11|MSTN
+#                       "seq.12077.32" # MSTN
+#                       "seq.14583.49", # MSTN
+#                       "seq.2985.35",  # CXCL1
+#                       "seq.5692.79",  # TNFa
+#                       "seq.5936.53"  # TNFa
+#                       "seq.16926.44", # ALPL/TNAP
+#                       "seq.3182.38", # ENTPD1
+#                       "seq.7999.23", # ENTPD1
+#                       "seq.15540.6"  # VIM
+# ) 
+# 
+# tmp <- mice_uniovi %>%
+#   dplyr::select(all_of(c(boxplot_aptamers, "genotype"))) %>%
+#   tidyr::pivot_longer(boxplot_aptamers, names_to = "AptName") %>%
+#   dplyr::left_join(analytes[ , c("AptName", "EntrezGeneSymbol")]) %>%
+#   dplyr::left_join(tab[ , c("AptName", "P.value.adj.KOvWT")]) %>%
+#   dplyr::group_by(AptName) %>% 
+#   dplyr::mutate(gene.aptamer = paste(EntrezGeneSymbol, AptName, sep = "."),
+#                 y.position = 1.04 * max(value),
+#                 p.adj.signif = dplyr::case_when(P.value.adj.KOvWT <  0.0001 ~ "****",
+#                                                 P.value.adj.KOvWT <  0.001  ~ "***",
+#                                                 P.value.adj.KOvWT <  0.01   ~ "**",
+#                                                 P.value.adj.KOvWT <= 0.05   ~ "*",
+#                                                 P.value.adj.KOvWT >  0.05   ~ "ns")) %>% 
+#   dplyr::ungroup()
+# 
+# 
+# stat_significance <- tmp %>% 
+#                         dplyr::filter(!duplicated(AptName)) %>% 
+#                         dplyr::mutate(group1 = rep("WT", nrow(.)),
+#                                       group2 = rep("KO", nrow(.)))
+# 
+# f1c <- ggplot(tmp, aes(genotype, value, color = genotype)) +
+#   geom_boxplot(aes(fill = genotype), outlier.shape = NA, alpha = 0.1) +
+#   geom_point(aes(shape = genotype), stroke = 1.1, size = 0.9, position = position_jitterdodge(jitter.width = 0.75)) +
+#   scale_color_manual(values = c(colors$WT, colors$KO), labels = c("Control", "Progeroid")) +
+#   scale_fill_manual(values = c("white", colors$KO), labels = c("Control", "Progeroid")) +
+#   scale_shape_manual(values = c("WT" = 1, "KO" = 19), labels = c("Control", "Progeroid")) +
+#   scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+#   theme_classic() +
+#   ylab(expression(log[2]*RFU)) +
+#   facet_wrap(~gene.aptamer, scales = "free", ncol = 5) +
+#   stat_pvalue_manual(stat_significance, label = "p.adj.signif", tip.length = 0.01, size = 5) +
+#   theme(axis.title.x=element_blank(),
+#         axis.text.x=element_blank(),
+#         axis.ticks.x=element_blank(),
+#         legend.position = "right",
+#         text = element_text(size = 12.5),
+#         legend.text=element_text(size=15),
+#         legend.title = element_blank(),
+#         panel.spacing = unit(10, "points")) +
+#   guides(color = guide_legend(label.hjust = 0))
+# 
+# f1c
+
+```
+
+```{r}
+f1 <- ggarrange(ggarrange(f1a + theme(legend.position = "none", plot.margin = margin(5.5, 5.5, 5.5, 7, unit = "pt")), get_legend(f1a), widths = c(.8, .2)),
+                NULL,
+                ggarrange(f1b + theme(legend.position = "none", plot.margin = margin(5.5, 5.5, 5.5, 7, unit = "pt")), get_legend(f1b), widths = c(.8, .2)),
+                heights = c(.475, .025, .5),
+                labels = c("(a)", "", "(b)"),
+                hjust = 0,
+                nrow = 3)
+
+
+ggsave("f1.pdf", plot = f1, device = "pdf", path = "figures/", width = 180, height = 217.8, units = "mm")
+
+
+f1_named <- f1 + theme(plot.margin = margin(t = 20, unit = "mm"))
+
+f1_named <- annotate_figure(f1_named, fig.lab = "Figure 1", fig.lab.size = 25)
+
+ggsave("f1_named.pdf", plot = f1_named, device = "pdf", path = "figures/", width = 180, height = 217.8 + 20, units = "mm")
+
+
+```
+
+### 4.2. Laki/Zmpste interaction with the genotype
+
+```{r}
+cols <- c("#83D1E2", "grey", "#EF8172")
+
+f2a1 <- tab %>% 
+  dplyr::arrange(-abs(t.LAKI_KOvWT)) %>% 
+  dplyr::mutate(x = row_number(), top = ifelse(x < 11, EntrezGeneSymbol, "")) %>% 
+  ggplot(aes(Coef.LAKI_KOvWT, -log10(P.value.adj.LAKI_KOvWT), color = ifelse(P.value.adj.LAKI_KOvWT > .05, "Not significant", ifelse(Coef.LAKI_KOvWT > 0, "Upregulated", "Downregulated")))) +
+  scale_color_manual(values = cols) +
+  geom_text_repel(aes(label = top), box.padding = .3, color = "black", max.overlaps = Inf, force = 9, size = 8/ggplot2::.pt) +
+  geom_point(aes(alpha = -log10(P.value.adj.LAKI_KOvWT))) +
+  geom_vline(xintercept = 0, linetype = 2, color = "black") +
+  geom_abline(slope=0, intercept=-log10(0.05), linetype = 2, color = "black") +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 12.5)) +
+  scale_x_continuous(expand = c(0,0), limits = c(-3, 3), breaks = seq(-3, 3, 1)) +
+  ylab(expression(-log[10]*FDR)) +
+  xlab(expression(log[2]*FC)) +
+  labs(color = "",
+       title = "<i>Lmna</i>") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 8),
+        axis.title = element_text(size = 10),
+        legend.position = "bottom",
+        legend.margin = margin(0,0,0,0),
+        legend.text = element_text(size=10, face = "bold"),
+        panel.grid = element_blank(),
+        plot.title = element_markdown(size = 12, hjust = 0.5, face = "bold")) +
+  guides(alpha = "none", colour = guide_legend(override.aes = list(size = 5)))
+
+f2a2 <- tab %>% 
+  dplyr::arrange(-abs(t.ZMPSTE_KOvWT)) %>% 
+  dplyr::mutate(x = row_number(), top = ifelse(x < 11, EntrezGeneSymbol, "")) %>% 
+  ggplot(aes(Coef.ZMPSTE_KOvWT, -log10(P.value.adj.ZMPSTE_KOvWT), color = ifelse(P.value.adj.ZMPSTE_KOvWT > .05, "Not significant", ifelse(Coef.ZMPSTE_KOvWT > 0, "Upregulated", "Downregulated")))) +
+  scale_color_manual(values = cols) +
+  geom_text_repel(aes(label = top), box.padding = .3, color = "black", max.overlaps = Inf, force = 9, size = 8/ggplot2::.pt) +
+  geom_point(aes(alpha = -log10(P.value.adj.ZMPSTE_KOvWT))) +
+  geom_vline(xintercept = 0, linetype = 2, color = "black") +
+  geom_abline(slope=0, intercept=-log10(0.05), linetype = 2, color = "black") +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 8)) +
+  scale_x_continuous(expand = c(0,0), limits = c(-2, 2), breaks = seq(-2,2, 0.5), labels = ifelse(breaks%%1 == 0, breaks, "")) +
+  ylab(expression(-log[10]*FDR)) +
+  xlab(expression(log[2]*FC)) +
+  labs(color = "",
+       title = "<i>Zmpste24</i>") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 8),
+        axis.title = element_text(size = 10),
+        legend.position = "bottom",
+        legend.margin = margin(0,0,0,0),
+        legend.text=element_text(size=10, face = "bold"),
+        panel.grid = element_blank(),
+        plot.title = element_markdown(size = 12, hjust = 0.5, face = "bold")) +
+  guides(alpha = "none", colour = guide_legend(override.aes = list(size = 5)))
+
+f2a <- ggpubr::ggarrange(f2a1, NULL, f2a2, common.legend = TRUE, legend = "bottom", widths = c(47.5, 5, 47.5), nrow = 1)
+ 
+```
+
+```{r}
+
+venn <- Venn(list("bold(italic(Lmna))" = tab$AptName[tab$P.value.adj.LAKI_KOvWT <.05], "bold(italic(Zmpste24))" = tab$AptName[tab$P.value.adj.ZMPSTE_KOvWT <.05]))
+data <- process_data(venn)
+
+f2b <- ggplot() +
+          geom_sf(aes(fill = id), data = venn_region(data)) +
+          geom_sf(color = "black", data = venn_setedge(data)) +
+          # geom_sf_text(aes(label = name), data = venn_setlabel(data), size = 10/ggplot2::.pt,
+          #              nudge_x = ifelse(data@region$name == "bold(italic(Lmna))", -30, 30), hjust = "outward", parse = TRUE) +
+          geom_sf_label(aes(label = count), data = venn_region(data), size = 10/ggplot2::.pt, alpha = 0, label.size = NA) +
+          annotate("text", x = 175, y = 780, label = "Lmna", fontface = "bold.italic", size = 10/ggplot2::.pt) +
+          annotate("text", x = 875, y = 780, label = "Zmpste24", fontface = "bold.italic", size = 10/ggplot2::.pt) +
+          scale_fill_manual(values = c("#FFD1AD", "#D8C4BF", "#8F8599")) +
+          lims(x = c(-100, 1100), y = c(0, 1000)) +
+          theme_void() +
+          theme(legend.position = "none")
+
+
+```
+
+```{r}
+cols <- c("grey", "#83D1E2", "#EF8172")
+up_both <- (tab$Coef.LAKI_KOvWT > 0 & tab$Coef.ZMPSTE_KOvWT > 0 & (tab$P.value.adj.LAKI_KOvWT < 0.05 | tab$P.value.adj.ZMPSTE_KOvWT < 0.05))
+down_both <- (tab$Coef.LAKI_KOvWT < 0 & tab$Coef.ZMPSTE_KOvWT < 0 & (tab$P.value.adj.LAKI_KOvWT < 0.05 | tab$P.value.adj.ZMPSTE_KOvWT < 0.05))
+up_laki_down_face <- (tab$Coef.LAKI_KOvWT > 0 & tab$Coef.ZMPSTE_KOvWT < 0 & (tab$P.value.adj.LAKI_KOvWT < 0.05 | tab$P.value.adj.ZMPSTE_KOvWT < 0.05))
+down_laki_up_face <- (tab$Coef.LAKI_KOvWT < 0 & tab$Coef.ZMPSTE_KOvWT > 0 & (tab$P.value.adj.LAKI_KOvWT < 0.05 | tab$P.value.adj.ZMPSTE_KOvWT < 0.05))
+
+
+f2c <- tab %>%
+  dplyr::filter(P.value.adj.LAKI_KOvWT < 0.05 | P.value.adj.ZMPSTE_KOvWT < 0.05) %>% 
+  ggplot(aes(Coef.LAKI_KOvWT, Coef.ZMPSTE_KOvWT)) +
+  geom_point(aes(color = ifelse(Coef.LAKI_KOvWT > 0 & Coef.ZMPSTE_KOvWT > 0, "up", ifelse(Coef.LAKI_KOvWT < 0 & Coef.ZMPSTE_KOvWT < 0, "down", "diverging")),
+                 alpha = ifelse(Coef.LAKI_KOvWT > 0 & Coef.ZMPSTE_KOvWT > 0, "up", ifelse(Coef.LAKI_KOvWT < 0 & Coef.ZMPSTE_KOvWT < 0, "down", "diverging"))),
+             size = 1.75) +
+  scale_color_manual(values = cols) +
+  scale_alpha_manual(values = c(0.3, 0.3, 0.3)) +
+  # geom_abline(slope=1, intercept=0, linetype = 2, color = "grey") +
+  geom_abline(slope=0, intercept=0, linetype = 2, color = "black") +
+  geom_vline(xintercept = 0, linetype = 2, color = "black") +
+  geom_smooth(method = "lm", formula = y ~ x, show.legend = FALSE, se = FALSE, color = "darkgreen", fullrange = TRUE) +
+  theme_bw() +
+  ylab("<i>Zmpste24</i> log<sub>2</sub>FC") +
+  xlab("<i>Lmna</i> log<sub>2</sub>FC") +
+  scale_x_continuous(expand = c(0,0), limits = c(-2.5, 2.5), breaks = c(0, seq(-2.5, 2.5, 1))) +
+  scale_y_continuous(expand = c(0,0), limits = c(-2.5, 2.5), breaks = c(0, seq(-2.5, 2.5, 1))) +
+  theme(legend.position="none",
+        panel.grid = element_blank(),
+        axis.text = element_text(size = 8),
+        axis.title.x = element_markdown(size = 10),   #axis.title alone did not work
+        axis.title.y = element_markdown(size = 10)) + 
+  annotate("text", x=2.4, y=2.4, label= as.character(sum(up_both)), size = 10/ggplot2::.pt, hjust = 1, vjust = 1) +
+  annotate("text", x=-2.4, y=2.4, label= as.character(sum(down_laki_up_face)), size = 10/ggplot2::.pt, hjust = 0, vjust = 1) +
+  annotate("text", x=-2.4, y=-2.4, label= as.character(sum(down_both)), size = 10/ggplot2::.pt, hjust = 0, vjust = 0) +
+  annotate("text", x=2.4, y=-2.4, label= as.character(sum(up_laki_down_face)), size = 10/ggplot2::.pt, hjust = 1, vjust = 0) +
+  stat_cor(aes(label = paste0("Pearson: ", after_stat(r))), label.x = 0.1, label.y = 2, size = 8/ggplot2::.pt, hjust = 0, vjust = 1, method = "pearson") +
+  stat_cor(aes(label = paste0("Spearman: ", after_stat(r))), label.x = 0.1, label.y = 2.4, size = 8/ggplot2::.pt, hjust = 0, vjust = 1, method = "spearman") +
+  stat_regline_equation(size = 8/ggplot2::.pt, label.x = -2.4, label.y = 2, vjust = 1)
+
+  
+
+```
+
+
+```{r}
+boxplot_genes_LAKI <- tab %>%
+                    dplyr::arrange(P.value.adj.LAKI_KOvWT) %>%
+                    dplyr::select(AptName, EntrezGeneSymbol) %>%
+                    head(10)
+boxplot_genes_FACE <- tab %>%
+                    dplyr::arrange(P.value.adj.ZMPSTE_KOvWT) %>%
+                    dplyr::select(AptName, EntrezGeneSymbol) %>%
+                    head(10)
+boxplot_genes <- dplyr::bind_rows(boxplot_genes_LAKI, boxplot_genes_FACE) %>% 
+                 dplyr::distinct()
+
+
+xy_position <- function(df, max_y, group_by, range) {
+
+  df <- df %>% 
+          dplyr::mutate(x1 = as.numeric(df[[group_by]]) - 0.25,
+                        x2 = as.numeric(df[[group_by]]) + 0.25,
+                        y1 = df[[max_y]] + 0.1 * df[[range]],
+                        y2 = df[[max_y]] + 0.13 * df[[range]],
+                        xlab = (x1 + x2) / 2,
+                        ylab = df[[max_y]] + 0.16 * df[[range]],
+                        vjust = ifelse(grepl("\\*", lab), 0.6, 0))
+  
+  return(df)
+  
+}
+
+ann_data_pos <- mice_uniovi %>% 
+              dplyr::select(all_of(boxplot_genes$AptName), "model") %>% 
+              tidyr::pivot_longer(cols = all_of(boxplot_genes$AptName), names_to = "AptName") %>% 
+              dplyr::group_by(model, AptName) %>% 
+              dplyr::mutate(y.position = max(value)) %>% 
+              dplyr::group_by(AptName) %>% 
+              dplyr::mutate(rg = max(value) - min(value)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::select(-value) %>% 
+              dplyr::distinct(model, AptName, .keep_all = TRUE)
+              
+  
+ann_data_label <- tab %>% 
+                   dplyr::select(AptName, P.value.adj.LAKI_KOvWT, P.value.adj.ZMPSTE_KOvWT, EntrezGeneSymbol) %>% 
+                   dplyr::filter(AptName %in% boxplot_genes$AptName) %>% 
+                   dplyr::rename(laki = P.value.adj.LAKI_KOvWT, zmpste = P.value.adj.ZMPSTE_KOvWT) %>% 
+                   tidyr::pivot_longer(cols = all_of(c("laki", "zmpste")), names_to = "model", values_to = "p.value.adj") %>% 
+                   dplyr::mutate(model = factor(model, levels = c("laki", "zmpste")),
+                                 lab = dplyr::case_when(p.value.adj <  0.0001 ~ "****",
+                                                        p.value.adj <  0.001  ~ "***",
+                                                        p.value.adj <  0.01   ~ "**",
+                                                        p.value.adj <= 0.05   ~ "*",
+                                                        p.value.adj >  0.05   ~ "ns"))
+
+ann_data <- dplyr::full_join(ann_data_pos, ann_data_label, by = join_by(model, AptName))
+
+ann_data <- xy_position(ann_data, max_y = "y.position", group_by = "model", range = "rg")
+
+f2d <- mice_uniovi %>%
+  dplyr::select(all_of(boxplot_genes$AptName), "genotype", "model") %>%
+  tidyr::pivot_longer(boxplot_genes$AptName, names_to = "AptName") %>%
+  dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::mutate(genotype.model = interaction(genotype, model)) %>% 
+  ggplot(aes(model, value)) +
+  geom_boxplot(aes(color = genotype.model, fill = genotype.model, shape = genotype.model), outlier.shape = NA, alpha = 0.2) +
+  geom_point(aes(color = genotype.model, fill = genotype.model, shape = genotype.model), stroke = 0.7, size = 0.8, position = position_jitterdodge(jitter.width = 0.5)) +
+  scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_color_manual(values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_fill_manual(values = setNames(c("white", colors$LakiKO, "white", colors$ZmpsteKO), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                              "<i>Zmpste24<sup>+/+</sup></i>",
+                              "<i>Zmpste24<sup>-/-</sup></i>")) +
+  # scale_x_discrete(labels = c("<i>Lmna</i>", "<i>Zmpste24</i>")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.15))) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free", nrow = 2) +
+  geom_text(data = ann_data, aes(x = xlab,  y = ylab, label = lab, vjust = vjust), hjust = 0.5, size = 8/ggplot2::.pt) +
+  geom_segment(data = ann_data, aes(x = x1, xend = x1, y = y1, yend = y2), colour = "black") +
+  geom_segment(data = ann_data, aes(x = x2, xend = x2, y = y1, yend = y2), colour = "black") +
+  geom_segment(data = ann_data, aes(x = x1, xend = x2, y = y2, yend = y2), colour = "black") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 10),
+        axis.text.x = element_blank(),
+        axis.ticks.x=element_blank(),
+        legend.position = "bottom",
+        # text = element_text(size = 12.5),
+        legend.text = element_markdown(size = 10, face = "bold"),
+        legend.title = element_blank(),
+        strip.text = element_text(size = 8, face = "bold"))
+    # guides(fill  = guide_legend(ncol=2),
+    #        color = guide_legend(ncol=2),
+    #        shape = guide_legend(ncol=2))
+
+        
+
+```
+
+```{r}
+f2 <- ggarrange(f2a,
+                ggarrange(f2b, f2c, labels = c("(b)", "(c)"), hjust = 0),
+                f2d +
+                # theme(legend.position = c(1, 0), legend.justification = c(1,0), legend.margin = margin(0, 0, 0, 0)),
+                theme(legend.position = "bottom",
+                      legend.text = element_markdown(margin = margin(r = 20, unit = "pt"))),
+                nrow = 3, labels = c("(a)", "", "(d)"), heights = c(3, 2.5, 4.5), hjust = 0)
+
+
+ggsave("f2.pdf", plot = f2, device = "pdf", path = "figures/", width = 180, height = 242, units = "mm")
+
+f2_named <- f2 + theme(plot.margin = margin(t = 20, unit = "mm"))
+
+f2_named <- annotate_figure(f2_named, fig.lab = "Figure 2", fig.lab.size = 25)
+
+ggsave("f2_named.pdf", plot = f2_named, device = "pdf", path = "figures/", width = 180, height = 242 + 20, units = "mm")
+
+```
+
+
+```{r}
+
+f2_v2 <- ggarrange(f2a,
+                   ggarrange(f2b, f2c, labels = c("(b)", "(c)"), hjust = 0),
+                   f2d + theme(legend.position = "none"),
+                   get_legend(igf1$plot),
+                   # ggarrange(fmod_out_rm$plot, igf1$plot + theme(axis.title.y = element_blank()), legend = "none"),
+                   ggarrange(NULL, f2e + theme(plot.margin = margin(b = -10)), NULL, nrow = 1, widths = c(0.1, 0.8, 0.1)),
+                   nrow = 5, labels = c("(a)", "", "(d)", "", "(e)"), heights = c(2.7, 2.4, 2.5, 0.3, 2.1), hjust = 0)
+
+
+ggsave("f2_v2.pdf", plot = f2_v2, device = "pdf", path = "figures/", width = 180, height = 242, units = "mm")
+
+f2_v2_named <- f2_v2 + theme(plot.margin = margin(t = 20, b = 0, unit = "mm"))
+
+f2_v2_named <- annotate_figure(f2_v2_named, fig.lab = "Figure 2", fig.lab.size = 25)
+
+ggsave("f2_v2_named.pdf", plot = f2_v2_named, device = "pdf", path = "figures/", width = 180, height = 242 + 20, units = "mm")
+
+```
+
+## Boxplots genotype:sex interaction
+
+```{r}
+
+aptamers_WTvsKO <- tab %>% 
+                    dplyr::filter(P.value.adj.SEX_KOvWT < 0.05) %>% 
+                    dplyr::pull(AptName)
+
+aptamers_LAKI <- tab %>% 
+                    dplyr::filter(P.value.adj.SEX_LAKI_KOvWT < 0.05) %>% 
+                    dplyr::pull(AptName)
+
+aptamers_FACE <- tab %>% 
+                    dplyr::filter(P.value.adj.SEX_ZMPSTE_KOvWT < 0.05) %>% 
+                    dplyr::pull(AptName)
+
+aptamers_WTvsKO %in% aptamers_LAKI
+
+aptamers_WTvsKO %in% aptamers_FACE
+
+```
+
+Both aptamers from the WTvsKO comparison are within the list of aptamers that show a significant genotype:sex interaction in LAKI
+
+```{r}
+
+# WTvsKO
+
+ann_data_pos <- mice_uniovi %>%
+              dplyr::select(all_of(aptamers_WTvsKO)) %>%
+              tidyr::pivot_longer(cols = all_of(aptamers_WTvsKO), names_to = "AptName") %>%
+              dplyr::group_by(AptName) %>%
+              dplyr::mutate(y.position = 1.05 * max(value)) %>%
+              dplyr::ungroup() %>%
+              dplyr::select(-value) %>%
+              dplyr::distinct(AptName, .keep_all = TRUE)
+
+
+ 
+ann_data_label  <- tab %>%
+                   dplyr::select(AptName, P.value.adj.SEX_KOvWT, EntrezGeneSymbol) %>%
+                   dplyr::filter(AptName %in% aptamers_WTvsKO) %>%
+                   dplyr::mutate(lab = round(P.value.adj.SEX_KOvWT, digits = 4),
+                                 sex = "male")
+
+ann_data <- dplyr::full_join(ann_data_pos, ann_data_label, by = join_by(AptName))
+
+
+s2a <- mice_uniovi %>%
+  dplyr::select(all_of(aptamers_WTvsKO), genotype, sex) %>%
+  tidyr::pivot_longer(aptamers_WTvsKO, names_to = "AptName") %>%
+  dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::mutate(genotype.sex = interaction(genotype, sex)) %>% 
+  ggplot(aes(sex, value)) +
+  geom_boxplot(aes(color = genotype.sex, fill = genotype.sex), outlier.shape = NA, alpha = 0.2) +
+  geom_point(aes(color = genotype.sex, fill = genotype.sex, shape = genotype.sex), position = position_jitterdodge(jitter.width = 0.2)) +
+  scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+                     labels = c("Control female",
+                                "Progeroid female",
+                                "Control male",
+                                "Progeroid male")) +
+  scale_color_manual(values = setNames(c("#CADA95", "#A8C256", "#52CBC3", "#2F9C95"),
+                                       c("WT.Female",   "KO.Female",   "WT.Male",     "KO.Male")),
+                     labels = c("Control female",
+                                "Progeroid female",
+                                "Control male",
+                                "Progeroid male")) +
+  scale_fill_manual(values = setNames(c("white", "#A8C256", "white", "#2F9C95"), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+                   labels = c("Control female",
+                              "Progeroid female",
+                              "Control male",
+                              "Progeroid male")) +
+  scale_x_discrete(labels = c("Female", "Male")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2)), labels = \(x) format(x, nsmall = 1)) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free") +
+  geom_text(data = ann_data, aes(y = y.position, label = paste0("italic(P) == ", lab)), parse = TRUE, x = 1.9, size = 8/ggplot2::.pt) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_markdown(),
+        legend.position = "bottom",
+        legend.text = element_markdown(size=15),
+        legend.title = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+```{r}
+
+# LAKI
+
+ann_data_pos <- mice_uniovi %>%
+              dplyr::filter(model == "laki") %>%
+              dplyr::select(all_of(aptamers_LAKI)) %>%
+              tidyr::pivot_longer(cols = all_of(aptamers_LAKI), names_to = "AptName") %>%
+              dplyr::group_by(AptName) %>%
+              dplyr::mutate(y.position = 1.05 * max(value)) %>%
+              dplyr::ungroup() %>%
+              dplyr::select(-value) %>%
+              dplyr::distinct(AptName, .keep_all = TRUE)
+
+
+ 
+ann_data_label  <- tab %>%
+                   dplyr::select(AptName, P.value.adj.SEX_LAKI_KOvWT, EntrezGeneSymbol) %>%
+                   dplyr::filter(AptName %in% aptamers_LAKI) %>%
+                   dplyr::mutate(lab = round(P.value.adj.SEX_LAKI_KOvWT, digits = 4),
+                                 sex = "male")
+
+ann_data <- dplyr::full_join(ann_data_pos, ann_data_label, by = join_by(AptName))
+
+
+s2b <- mice_uniovi %>%
+  dplyr::filter(model == "laki") %>% 
+  dplyr::select(all_of(aptamers_LAKI), genotype, sex) %>%
+  tidyr::pivot_longer(aptamers_LAKI, names_to = "AptName") %>%
+  dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::mutate(genotype.sex = interaction(genotype, sex)) %>% 
+  ggplot(aes(sex, value)) +
+  geom_boxplot(aes(color = genotype.sex, fill = genotype.sex), outlier.shape = NA, alpha = 0.2) +
+  geom_point(aes(color = genotype.sex, fill = genotype.sex, shape = genotype.sex), position = position_jitterdodge(jitter.width = 0.2)) +
+  scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i> female",
+                                "<i>Lmna<sup>G609G/G609G</sup></i> female",
+                                "<i>Lmna<sup>+/+</sup></i> male",
+                                "<i>Lmna<sup>G609G/G609G</sup></i> male")) +
+  scale_color_manual(values = setNames(c("#CADA95", "#A8C256", "#52CBC3", "#2F9C95"),
+                                       c("WT.Female",   "KO.Female",   "WT.Male",     "KO.Male")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i> female",
+                                "<i>Lmna<sup>G609G/G609G</sup></i> female",
+                                "<i>Lmna<sup>+/+</sup></i> male",
+                                "<i>Lmna<sup>G609G/G609G</sup></i> male")) +
+  scale_fill_manual(values = setNames(c("white", "#A8C256", "white", "#2F9C95"), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+                   labels = c("<i>Lmna<sup>+/+</sup></i> female",
+                              "<i>Lmna<sup>G609G/G609G</sup></i> female",
+                              "<i>Lmna<sup>+/+</sup></i> male",
+                              "<i>Lmna<sup>G609G/G609G</sup></i> male")) +
+  scale_x_discrete(labels = c("Female", "Male")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2)), labels = \(x) format(x, nsmall = 1)) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free") +
+  geom_text(data = ann_data, aes(y = y.position, label = paste0("italic(P) == ", lab)), parse = TRUE, x = 1.9, size = 8/ggplot2::.pt) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_markdown(),
+        legend.position = "bottom",
+        legend.text = element_markdown(size=15),
+        legend.title = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+```{r}
+
+# FACE
+
+ann_data_pos <- mice_uniovi %>%
+              dplyr::filter(model == "zmpste") %>%
+              dplyr::select(all_of(aptamers_FACE)) %>%
+              tidyr::pivot_longer(cols = all_of(aptamers_FACE), names_to = "AptName") %>%
+              dplyr::group_by(AptName) %>%
+              dplyr::mutate(y.position = 1.05 * max(value)) %>%
+              dplyr::ungroup() %>%
+              dplyr::select(-value) %>%
+              dplyr::distinct(AptName, .keep_all = TRUE)
+
+
+ 
+ann_data_label  <- tab %>%
+                   dplyr::select(AptName, P.value.adj.SEX_ZMPSTE_KOvWT, EntrezGeneSymbol) %>%
+                   dplyr::filter(AptName %in% aptamers_FACE) %>%
+                   dplyr::mutate(lab = round(P.value.adj.SEX_ZMPSTE_KOvWT, digits = 4),
+                                 sex = "male")
+
+ann_data <- dplyr::full_join(ann_data_pos, ann_data_label, by = join_by(AptName)) %>% 
+                dplyr::mutate(EntrezGeneSymbol.AptName = paste0(EntrezGeneSymbol, "-", AptName),
+                              EntrezGeneSymbol = ifelse(EntrezGeneSymbol %in% EntrezGeneSymbol[duplicated(EntrezGeneSymbol)],
+                                                           paste0(EntrezGeneSymbol, "<br>(", AptName, ")"),
+                                                           EntrezGeneSymbol))
+
+
+s2c <- mice_uniovi %>%
+  dplyr::filter(model == "zmpste") %>% 
+  dplyr::select(all_of(aptamers_FACE), genotype, sex) %>%
+  tidyr::pivot_longer(aptamers_FACE, names_to = "AptName") %>%
+  dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::mutate(genotype.sex = interaction(genotype, sex),
+                EntrezGeneSymbol.AptName = paste0(EntrezGeneSymbol, "-", AptName)) %>% 
+  ggplot(aes(sex, value)) +
+  geom_boxplot(aes(color = genotype.sex, fill = genotype.sex), outlier.shape = NA, alpha = 0.2) +
+  geom_point(aes(color = genotype.sex, fill = genotype.sex, shape = genotype.sex), position = position_jitterdodge(jitter.width = 0.2)) +
+  # scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+  #                    labels = c("<i>Zmpste24<sup>+/+</sup></i> female",
+  #                               "<i>Zmpste24<sup>-/-</sup></i> female",
+  #                               "<i>Zmpste24<sup>+/+</sup></i> male",
+  #                               "<i>Zmpste24<sup>-/-</sup></i> male")) +
+  # scale_color_manual(values = setNames(c("#CADA95", "#A8C256", "#2F9C95", "#2F9C95"),
+  #                                      c("WT.Female",   "KO.Female",   "WT.Male",     "KO.Male")),
+  #                    labels = c("<i>Zmpste24<sup>+/+</sup></i> female",
+  #                               "<i>Zmpste24<sup>-/-</sup></i> female",
+  #                               "<i>Zmpste24<sup>+/+</sup></i> male",
+  #                               "<i>Zmpste24<sup>-/-</sup></i> male")) +
+  # scale_fill_manual(values = setNames(c("white", "#A8C256", "white", "#2F9C95"), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+  #                  labels = c("<i>Zmpste24<sup>+/+</sup></i> female",
+  #                             "<i>Zmpste24<sup>-/-</sup></i> female",
+  #                             "<i>Zmpste24<sup>+/+</sup></i> male",
+  #                             "<i>Zmpste24<sup>-/-</sup></i> male")) +
+  scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+                     labels = c("Control female",
+                                "Progeroid female",
+                                "Control male",
+                                "Progeroid male")) +
+  scale_color_manual(values = setNames(c("#CADA95", "#A8C256", "#52CBC3", "#2F9C95"),
+                                       c("WT.Female",   "KO.Female",   "WT.Male",     "KO.Male")),
+                     labels = c("Control female",
+                                "Progeroid female",
+                                "Control male",
+                                "Progeroid male")) +
+  scale_fill_manual(values = setNames(c("white", "#A8C256", "white", "#2F9C95"), c("WT.Female", "KO.Female", "WT.Male", "KO.Male")),
+                   labels = c("Control female",
+                              "Progeroid female",
+                              "Control male",
+                              "Progeroid male")) +
+  scale_x_discrete(labels = c("Female", "Male")) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.2)), labels = \(x) format(x, nsmall = 1)) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol.AptName, scales = "free", ncol = 5,
+             labeller = as_labeller(setNames(ann_data$EntrezGeneSymbol, ann_data$EntrezGeneSymbol.AptName))) +
+  geom_text(data = ann_data, aes(y = y.position, label = paste0("italic(P) == ", lab)), parse = TRUE, x = 1.9, size = 8/ggplot2::.pt) +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_markdown(),
+        strip.text = element_markdown(face = "bold"),
+        legend.position = c(0.58, 0.1),
+        legend.text = element_markdown(size=15),
+        legend.title = element_blank()) +
+  guides(shape = guide_legend(nrow = 1),
+         colour = guide_legend(nrow = 1),
+         fill = guide_legend(nrow = 1))
+```
+
+```{r}
+
+t_col <- function(color, percent = 50, name = NULL) {
+  #      color = color name
+  #      percent = % transparency
+  #      name = an optional name for the color
+
+## Get RGB values for named color
+rgb.val <- col2rgb(color)
+
+## Make new color using input color as base and alpha set by transparency
+t.col <- rgb(rgb.val[1], rgb.val[2], rgb.val[3],
+             max = 255,
+             alpha = (100 - percent) * 255 / 100,
+             names = name)
+
+## Save the color
+invisible(t.col)
+}
+
+bg_WTvsKO <- t_col(colors$KO, percent = 70)
+bg_LAKI <- t_col(colors$LakiKO, percent = 80)
+bg_FACE <- t_col(colors$ZmpsteKO, percent = 70)
+
+mod <- 
+
+s2 <- ggarrange(NULL,
+                ggarrange(s2a + theme(legend.position = "none"), s2b + theme(legend.position = "none",
+                                                                             axis.title.y = element_blank()),
+                          widths = c(2.08/5, 2.92/5), labels = c("(a)", "(b)"), hjust = c(-0.1, -0.2)),
+                NULL,
+                s2c + theme(legend.text = element_markdown(size = 10, face = "bold", margin = margin(r = 20, unit = "pt"))) +
+                      guides(fill  = guide_legend(ncol=2),
+                             color = guide_legend(ncol=2),
+                             shape = guide_legend(ncol=2)),
+                nrow = 4, heights = c(4, 18.4, 4, 73.6), labels = c(rep("", 3), "(c)"), hjust = -0.1)
+           
+
+# v1
+# s2
+# grid.roundrect(width = 0.4, height= 0.19, x = 0.2, y = 0.875,
+#                gp=gpar(fill = bg_WTvsKO))
+# grid.roundrect(width = 0.6, height= 0.19, x = 0.7, y = 0.875,
+#                gp=gpar(fill = bg_LAKI))
+# grid.roundrect(width = 1, height= 0.7, x = 0.5, y = 0.4,
+#                gp=gpar(fill = bg_FACE))
+
+# v2
+
+pdf("figures/s2.pdf", width = 180/25.4, height = 242/25.4 - 25/25.4)  # 1 in = 25.4 mm
+
+s2
+grid.segments(x0 = 0.01, y0 = 0.97, x1 = 0.4, y1 = 0.97,
+              gp = gpar(col = colors$KO, lwd = 6))
+grid.segments(x0 = 0.43, y0 = 0.97, x1 = 0.99, y1 = 0.97,
+              gp = gpar(col = colors$LakiKO, lwd = 6))
+grid.segments(x0 = 0.01, y0 = 0.75, x1 = 0.99, y1 = 0.75,
+              gp = gpar(col = colors$ZmpsteKO, lwd = 6))
+ComplexHeatmap::grid.textbox(expression("Control"~italic("vs.")~"Progeroid"),
+                             x = 0.2, y = 0.97, gp = gpar(col = colors$KO, fontsize = 14),
+                             background_gp = gpar(col = "white", fill = "white"))
+ComplexHeatmap::grid.textbox(expression(italic("Lmna")),
+                             x = 0.7025, y = 0.97, gp = gpar(col = colors$LakiKO, fontsize = 14),
+                             background_gp = gpar(col = "white", fill = "white"))
+ComplexHeatmap::grid.textbox(expression(italic("Zmpste24")),
+                             x = 0.5, y = 0.75, gp = gpar(col = colors$ZmpsteKO, fontsize = 14),
+                             background_gp = gpar(col = "white", fill = "white"))
+
+dev.off()
+
+```
+
+### ORA: WT vs. KO
+
+```{r}
+tmp <- tab %>% 
+  dplyr::filter(P.value.adj.KOvWT < 0.05) %>%  
+  dplyr::arrange(P.value.adj.KOvWT)
+
+go <- enrichGO(gene = head(tmp$EntrezGeneID, 500),
+               universe = tab$EntrezGeneID ,
+               OrgDb = 'org.Hs.eg.db',
+               ont = "ALL",
+               readable = TRUE,
+               pool = TRUE)
+
+go@result <- go@result %>%
+                dplyr::mutate(richFactor = Count/as.numeric(sub("/\\d+", "", BgRatio)),
+                              foldEnrichment = (as.numeric(sub("/\\d+", "", GeneRatio)) / as.numeric(sub("\\d+/", "", GeneRatio))) /
+                                               (as.numeric(sub("/\\d+", "", BgRatio)) / as.numeric(sub("\\d+/", "", BgRatio)))) %>%
+                dplyr::arrange(p.adjust)
+
+addWorksheet(OUT, "GO_KOvsWT")
+writeData(OUT, sheet = "GO_KOvsWT", x = go@result, rowNames = F)
+
+
+
+```
+
+### ORA: LAKI WT vs. KO
+
+```{r}
+tmp <- tab %>% 
+  dplyr::filter(P.value.adj.LAKI_KOvWT < 0.05) %>%  
+  dplyr::arrange(P.value.adj.LAKI_KOvWT)
+
+go_laki <- enrichGO(gene = head(tmp$EntrezGeneID, 500),
+                    universe = tab$EntrezGeneID ,
+                    OrgDb = 'org.Hs.eg.db',
+                    ont = "ALL",
+                    readable = TRUE,
+                    pool = TRUE)
+
+go_laki@result <- go_laki@result %>% 
+                        dplyr::mutate(richFactor = Count/as.numeric(sub("/\\d+", "", BgRatio)),
+                                      foldEnrichment = (as.numeric(sub("/\\d+", "", GeneRatio)) / as.numeric(sub("\\d+/", "", GeneRatio))) /
+                                                       (as.numeric(sub("/\\d+", "", BgRatio)) / as.numeric(sub("\\d+/", "", BgRatio)))) %>% 
+                        dplyr::arrange(p.adjust)
+
+addWorksheet(OUT, "GO_LAKI_KOvsWT") # New excel sheet
+writeData(OUT, sheet = "GO_LAKI_KOvsWT", x = go_laki@result, rowNames = F)
+
+```
+
+### ORA: FACE WT vs. KO
+
+```{r}
+tmp <- tab %>% 
+  dplyr::filter(P.value.adj.ZMPSTE_KOvWT < 0.05) %>%  
+  dplyr::arrange(P.value.adj.ZMPSTE_KOvWT)
+
+go_face <- enrichGO(gene = head(tmp$EntrezGeneID, 500),
+                    universe = tab$EntrezGeneID ,
+                    OrgDb = 'org.Hs.eg.db',
+                    ont = "ALL",
+                    readable = TRUE,
+                    pool = TRUE)
+
+go_face@result <- go_face@result %>% 
+                        dplyr::mutate(richFactor = Count/as.numeric(sub("/\\d+", "", BgRatio)),
+                                      foldEnrichment = (as.numeric(sub("/\\d+", "", GeneRatio)) / as.numeric(sub("\\d+/", "", GeneRatio))) /
+                                                       (as.numeric(sub("/\\d+", "", BgRatio)) / as.numeric(sub("\\d+/", "", BgRatio)))) %>% 
+                        dplyr::arrange(p.adjust)
+
+addWorksheet(OUT, "GO_FACE_KOvsWT") # New excel sheet
+writeData(OUT, sheet = "GO_FACE_KOvsWT", x = go_face@result, rowNames = F)
+
+
+```
+
+```{r}
+
+f3a <- head(go@result, 10) %>% 
+            ggplot(aes(forcats::fct_reorder(Description, p.adjust, .desc = TRUE), foldEnrichment)) +
+              geom_point(aes(fill = p.adjust, size = Count), shape=21) +
+              theme_bw() +
+              coord_flip() +
+              scale_fill_gradient(guide = guide_colourbar(reverse = TRUE), breaks = scales::breaks_extended(6), name = "FDR", low = "#DEC93F", high = "#474935") +
+              scale_size_continuous(range = c(2, 6)) +
+              scale_x_discrete(labels = \(x) stringr::str_wrap(x, width = 41)) +
+              geom_hline(yintercept = 0) +
+              labs(x = NULL, y = "Fold enrichment") +
+              theme(axis.title = element_text(size = 10),
+                    axis.text = element_text(size = 8)) +
+              guides(size = guide_legend(title = "Count"))
+
+
+```
+
+```{r}
+s3a <- head(go_laki@result, 10) %>% 
+            ggplot(aes(forcats::fct_reorder(Description, p.adjust, .desc = TRUE), foldEnrichment)) +
+              geom_point(aes(fill = p.adjust, size = Count), shape=21) +
+              theme_bw() +
+              coord_flip() +
+              scale_fill_gradient(guide = guide_colourbar(reverse = TRUE), breaks = scales::breaks_extended(5), name = "FDR", low = "#DEC93F", high = "#474935") +
+              scale_size_continuous(range = c(2, 6)) +
+              scale_x_discrete(labels = \(x) stringr::str_wrap(x, width = 41)) +
+              geom_hline(yintercept = 0) +
+              labs(x = NULL, y = "Fold enrichment") +
+              theme(axis.title = element_text(size = 10),
+                    axis.text = element_text(size = 8)) +
+              guides(size = guide_legend(title = "Count"))
+
+s3b <- head(go_face@result, 10) %>% 
+            ggplot(aes(forcats::fct_reorder(Description, p.adjust, .desc = TRUE), foldEnrichment)) +
+              geom_point(aes(fill = p.adjust, size = Count), shape=21) +
+              theme_bw() +
+              coord_flip() +
+              scale_fill_gradient(guide = guide_colourbar(reverse = TRUE), breaks = scales::breaks_extended(5), name = "FDR", low = "#DEC93F", high = "#474935") +
+              scale_size_continuous(range = c(2, 6)) +
+              scale_x_discrete(labels = \(x) stringr::str_wrap(x, width = 41)) +
+              geom_hline(yintercept = 0) +
+              labs(x = NULL, y = "Fold enrichment") +
+              theme(axis.title = element_text(size = 10),
+                    axis.text = element_text(size = 8)) +
+              guides(size = guide_legend(title = "Count"))
+```
+
+## Heatmaps
+
+```{r}
+
+color_breaks = c(seq(-3,-1,length=30), seq(-0.9, 0.9, length=30), seq(1, 3, length=30))
+
+palette_heatmap <- colorRampPalette(c("blue", "white", "red"))(n = 89)
+
+
+my_hclust <- hclust
+formals(my_hclust)$method <- "ward.D2"
+
+
+heatmap_legend <- ggplot(data.frame(x = 1:4, y = 1:4, genotype.model = factor(c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste"),
+                                                                              levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste"))),
+                         aes(x, y, fill = genotype.model)) +
+                    geom_point(alpha=0, shape = 22) +
+                    guides(fill = guide_legend(override.aes = list(alpha=1, size = 10))) +
+                    scale_fill_manual(values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO),
+                                                        c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                      labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                                 "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                                 "<i>Zmpste24<sup>+/+</sup></i>",
+                                                 "<i>Zmpste24<sup>-/-</sup></i>")) +
+                    theme_bw() +
+                    theme(axis.title = element_blank(),
+                          axis.text = element_blank(),
+                          axis.ticks = element_blank(),
+                          legend.position = "right",
+                          legend.direction = "horizontal",
+                          legend.title = element_blank(),
+                          legend.text = element_markdown(size = 10, margin = margin(l = -5, r = 5, unit = "pt"), face = "bold"),
+                          # legend.key.height = unit(0.01, 'cm'),
+                          panel.grid = element_blank(),
+                          panel.border = element_blank()
+                          # panel.border = element_rect(colour = "black", fill='white', linewidth = 1)
+                    ) 
+
+heatmap_legend_laki <- ggplot(data.frame(x = 1:2, y = 1:2, genotype.model = factor(c("WT.laki", "KO.laki"),
+                                                                              levels = c("WT.laki", "KO.laki"))),
+                         aes(x, y, fill = genotype.model)) +
+                    geom_point(alpha=0, shape = 22) +
+                    guides(fill = guide_legend(override.aes = list(alpha=1, size = 10))) +
+                    scale_fill_manual(values = setNames(c(colors$LakiWT, colors$LakiKO),
+                                                        c("WT.laki", "KO.laki")),
+                                      labels = c("<i>Lmna<sup> +/+</sup></i>",
+                                                 "<i>Lmna<sup> G609G/G609G</sup></i>")) +
+                    theme_bw() +
+                    theme(axis.title = element_blank(),
+                          axis.text = element_blank(),
+                          axis.ticks = element_blank(),
+                          legend.position = "right",
+                          legend.direction = "horizontal",
+                          legend.title = element_blank(),
+                          legend.text = element_markdown(size = 10, margin = margin(l = -5, r = 5, unit = "pt"), face = "bold"),
+                          panel.grid = element_blank(),
+                          panel.border = element_blank()
+                          # panel.border = element_rect(colour = "black", fill='white', linewidth = 1)
+                    )
+
+heatmap_legend_laki <- as.ggplot(get_legend(heatmap_legend_laki))
+
+
+heatmap_legend_face <- ggplot(data.frame(x = 1:4, y = 1:4, genotype.model = factor(c("WT.zmpste", "KO.zmpste"),
+                                                                              levels = c("WT.zmpste", "KO.zmpste"))),
+                         aes(x, y, fill = genotype.model)) +
+                    geom_point(alpha=0, shape = 22) +
+                    guides(fill = guide_legend(override.aes = list(alpha=1, size = 10))) +
+                    scale_fill_manual(values = setNames(c(colors$ZmpsteWT, colors$ZmpsteKO),
+                                                        c("WT.zmpste", "KO.zmpste")),
+                                      labels = c("<i>Zmpste24<sup> +/+</sup></i>",
+                                                 "<i>Zmpste24<sup> -/-</sup></i>")) +
+                    theme_bw() +
+                    theme(axis.title = element_blank(),
+                          axis.text = element_blank(),
+                          axis.ticks = element_blank(),
+                          legend.position = "right",
+                          legend.direction = "horizontal",
+                          legend.title = element_blank(),
+                          legend.text = element_markdown(size = 10, margin = margin(l = -5, r = 5, unit = "pt"), face = "bold"),
+                          panel.grid = element_blank(),
+                          panel.border = element_blank()
+                          # panel.border = element_rect(colour = "black", fill='white', linewidth = 1)
+                    )
+
+heatmap_legend_face <- as.ggplot(get_legend(heatmap_legend_face))
+
+ggsave("color_legend_heatmap.pdf", plot = heatmap_legend, device = "pdf", path = "figures/heatmaps/", height = 6, width = 6.5, units = "in")
+
+
+```
+
+### Heatmaps WTvsKO
+
+```{r}
+####### Selected terms to plot in heatmaps:
+# ECM = CC	GO:0031012	Extracellular matrix
+# cardiovascular = BP	GO:0007507	Heart development
+# somatotroph_axis = BP	GO:0070848	Response to growth factor
+# BMP = BP	GO:0071772	Response to BMP
+# calcium = MF	GO:0005509	Calcium ion binding
+# vegf = BP	GO:0048010 vascular endothelial growth factor receptor signaling pathway
+# notch GO:0007219	Notch signaling pathway
+
+go_IDs <- c("GO:0031012", "GO:0007507", "GO:0070848", "GO:0071772", "GO:0005509", "GO:0048010", "GO:0007219", "GO:0001756", "GO:0003007")
+go_names <- c("Extracellular matrix",
+              "Heart development",
+              "Response to growth factor",
+              "Response to BMP",
+              "Calcium ion binding",
+              "VEGFR signaling pathway",
+              "Notch signaling pathway",
+              "Somitogenesis",
+              "Heart morphogenesis")
+
+make_heatmaps_WTvsKO <- function() {
+  
+  heatmaps_list <- list()
+  laki <- mice_uniovi$model == "laki"
+  face <- mice_uniovi$model == "zmpste"
+  
+  for (i in seq_along(go_IDs)) {
+    
+    gene_list <- data.frame(gene_symbol = unlist(stringr::str_split(go@result$geneID[go@result$ID == go_IDs[i]],
+                                                                    pattern = "/"))) %>% 
+      dplyr::left_join(tab[, c("AptName", "Target", "EntrezGeneSymbol", "P.value.adj.KOvWT")],
+                       by = c("gene_symbol" = "EntrezGeneSymbol")) %>% 
+      dplyr::filter(P.value.adj.KOvWT < 0.05)
+    
+    df <- mice_uniovi
+    rownames(df) <- paste(df$id, df$genotype, sep = "_")
+    mat <- df %>% 
+             dplyr::select(gene_list$AptName) %>% 
+             as.matrix()
+    
+    mat_scaled <- scale(mat)
+    
+    row_dist <- as.dist(1-cor(mat))
+    row_hclust <- hclust(row_dist, method = "ward.D2")
+    row_medians <- matrixStats::colMedians(mat)
+    row_dendrogram <- reorder(as.dendrogram(row_hclust), row_medians, agglo.FUN = median)
+    row_names <- gene_list$EntrezGeneSymbol
+    
+    
+    # LAKI
+    
+    col_dist <- dist(mat[laki, ], method = "euclidean")
+    col_hclust <- hclust(col_dist, method = "ward.D2")
+    col_medians <- matrixStats::rowMedians(mat[laki, ])
+    col_dendrogram <- reorder(as.dendrogram(col_hclust), col_medians, agglo.FUN = median)
+    col_dendrogram <- dendextend::rotate(col_dendrogram, c(grep("WT", as.hclust(col_dendrogram)$labels, value = TRUE),
+                                                           grep("KO", as.hclust(col_dendrogram)$labels, value = TRUE)))
+    
+    
+    mat_laki <- mat_scaled[laki, ]
+    heatmap_colors <- ifelse(mice_uniovi[mice_uniovi$model == "laki", ]$genotype == "WT", colors$LakiWT, colors$LakiKO)
+    
+    
+    if(i == 1){
+
+      color_key <- ~heatmap.2(t(mat_scaled),
+                              dendrogram = "none",
+                              scale = "none",
+                              breaks = color_breaks,
+                              symbreaks = TRUE,
+                              col = palette_heatmap,
+                              trace = "none",
+                              margins = c(.01, .01),
+                              labCol = "",
+                              key = TRUE,
+                              keysize = 0.1,
+                              density.info = "none",
+                              symkey = TRUE,
+                              key.title = "Z-score",
+                              key.xlab = "",
+                              # key.par = list(cex = 1.8),
+                              lwid = c(0.6, 0.1),
+                              lhei = c(0.7, 0.01)
+      )
+
+      color_key <- base2grob(color_key)
+
+      to_rm <- c("graphics-plot-1-bottom-axis-labels-1",
+                 "graphics-plot-1-image-rect-1",
+                 "graphics-plot-1-right-axis-labels-1",
+                 "graphics-plot-1-text-1",
+                 "graphics-plot-1-xlab-1",
+                 "graphics-plot-1-ylab-1",
+                 "graphics-plot-4-bottom-axis-line-1",
+                 "graphics-plot-4-mtext-bottom-1",
+                 "graphics-plot-4-xlab-1",
+                 "graphics-plot-4-ylab-1" )
+      
+
+      for (j in to_rm) {
+          
+          color_key <- removeGrob(color_key, j, grep = TRUE,
+                                  global = FALSE)
+
+      }
+        
+      x_labels <- getGrob(color_key, "graphics-plot-4-bottom-axis-labels-1")
+      x_labels <- editGrob(x_labels, gp = gpar(ps = 8))
+      
+      color_key <- setGrob(gTree = color_key, 
+                           gPath = "graphics-plot-4-bottom-axis-labels-1",
+                           newGrob = x_labels)
+      
+      # Increase box line width
+      
+      box <- getGrob(color_key, "graphics-plot-4-box-1")
+      box <- editGrob(box, gp = gpar(lwd = unit(2, "pt")))
+      
+      color_key <- setGrob(gTree = color_key, 
+                           gPath = "graphics-plot-4-box-1",
+                           newGrob = box)
+      
+      
+      color_key <- as.ggplot(color_key)
+
+      heatmaps_list[[length(go_IDs) + 1]] <- color_key
+      names(heatmaps_list)[length(go_IDs) + 1] <- "color_key"
+
+    }
+    
+    
+    ht1 <- ~heatmap.2(t(mat_laki),
+                      Rowv = row_dendrogram,
+                      Colv = col_dendrogram,
+                      hclustfun = my_hclust,
+                      dendrogram = "column",
+                      reorderfun = function(d, w) reorder(d, w, agglo.FUN = median),
+                      scale = "none",
+                      breaks = color_breaks,
+                      symbreaks = TRUE,
+                      col = palette_heatmap,
+                      trace = "none",
+                      margins = c(1, 1),
+                      ColSideColor = heatmap_colors,
+                      labRow = "",
+                      labCol = "",
+                      key = FALSE,
+                      density.info = "none",
+                      lwid = c(0.01, 1)
+                      # lwid = c(0.1, 1)  # when adding gene/protein names
+    )
+    
+    ht1 <- base2grob(ht1)
+    to_rm <- c("graphics-plot-1-xlab-1",
+               "graphics-plot-1-ylab-1",
+               "graphics-plot-2-bottom-axis-labels-1",
+               "graphics-plot-2-right-axis-labels-1",
+               "graphics-plot-2-text-1",
+               "graphics-plot-2-xlab-1",
+               "graphics-plot-2-ylab-1",
+               "graphics-plot-4-xlab-1",
+               "graphics-plot-4-ylab-1")
+    
+    
+    for (j in to_rm) {
+      ht1 <- removeGrob(ht1, j, grep = TRUE,
+                        global = FALSE)
+    }
+    
+    ht1 <- as.ggplot(ht1)
+    
+    
+    # FACE
+    
+    col_dist <- dist(mat[face, ], method = "euclidean")
+    col_hclust <- hclust(col_dist, method = "ward.D2")
+    col_medians <- rowMedians(mat[face, ])
+    col_dendrogram <- reorder(as.dendrogram(col_hclust), col_medians, agglo.FUN = median)
+    col_dendrogram <- dendextend::rotate(col_dendrogram, c(grep("WT", as.hclust(col_dendrogram)$labels, value = TRUE),
+                                                           grep("KO", as.hclust(col_dendrogram)$labels, value = TRUE)))
+    
+    mat_face <- mat_scaled[face, ]
+    heatmap_colors <- ifelse(mice_uniovi[mice_uniovi$model == "zmpste", ]$genotype == "WT",
+                             colors$ZmpsteWT, colors$ZmpsteKO)
+    
+    
+    ht2 <- ~heatmap.2(t(mat_face),
+                      Rowv = row_dendrogram,
+                      Colv = col_dendrogram,
+                      hclustfun = my_hclust,
+                      dendrogram = "column",
+                      reorderfun = function(d, w) reorder(d, w, agglo.FUN = median),
+                      scale = "none",
+                      breaks = color_breaks,
+                      symbreaks = TRUE,
+                      col = palette_heatmap,
+                      trace = "none",
+                      # margins = c(1, 1),
+                      margins = c(1, 9),
+                      # margins = c(1, 19),  # to add gene/protein names on the right side
+                      ColSideColor = heatmap_colors,
+                      cexRow = 5,
+                      labRow = row_names,
+                      labCol = "",
+                      key = FALSE,
+                      density.info = "none",
+                      lwid = c(0.01, 1)
+                      # lwid = c(0.01, 9)   # when adding gene/protein names
+    )
+    
+    
+    ht2 <- base2grob(ht2)
+    to_rm <- c("graphics-plot-1-xlab-1",
+               "graphics-plot-1-ylab-1",
+               "graphics-plot-2-bottom-axis-labels-1",
+               # "graphics-plot-2-right-axis-labels-1",    # comment to keep gene/protein names
+               "graphics-plot-2-text-1",
+               "graphics-plot-2-xlab-1",
+               "graphics-plot-2-ylab-1",
+               "graphics-plot-4-xlab-1",
+               "graphics-plot-4-ylab-1")
+    
+      
+    for (j in to_rm) {
+      ht2 <- removeGrob(ht2, j, grep = TRUE, global = FALSE)
+    }
+    
+    ht2 <- as.ggplot(ht2)
+    
+    
+    
+    ht_title <- text_grob(go_names[i], size = 12, x = 0.5, face = "bold")
+                                                # x = 0.415  # when adding gene/protein names
+                          
+
+    ht_title <- as_ggplot(ht_title) + theme(plot.margin = margin(0, 0, 3, 0))
+    
+    
+    
+    hts <- ggarrange(ht1, ht2
+                     # widths = c(41.5, 58.5)  # When adding gene/protein names
+                     )
+    
+    ht <- ggarrange(ht_title, hts, nrow = 2, heights = c(10, 90))
+    
+    heatmaps_list[[i]] <- ht
+    names(heatmaps_list)[i] <- go_names[i]
+    
+  }
+  
+  return(heatmaps_list)
+
+}
+
+heatmaps_WTvsKO <- make_heatmaps_WTvsKO()
+
+```
+
+```{r}
+f3b <- heatmaps_WTvsKO$`Extracellular matrix`
+f3c <- heatmaps_WTvsKO$`Response to growth factor`
+f3d <- heatmaps_WTvsKO$`Calcium ion binding`
+
+mod <- theme(plot.margin = margin(22, 0, 22, 5),
+             text = element_text(size = 8),
+             axis.ticks.length = unit(1, "pt")
+)
+
+
+f3 <- ggarrange(ggarrange(f3a + theme(legend.position = c(0, 0),
+                                         legend.box = "horizontal",
+                                         legend.direction = "horizontal",
+                                         legend.box.margin = margin(t = -5, r = 15, b = -90, l = -160),
+                                         legend.margin = margin(r = 5.5, l = 5.5),
+                                         legend.justification = 0,
+                                         legend.spacing.x = unit(2, "pt"),
+                                         legend.spacing.y = unit(5, "pt"),
+                                         legend.text = element_text(size = 8, margin = margin(t = 0)),
+                                         legend.title = element_text(size = 10, vjust = 0.9),
+                                         plot.margin = margin(t = 5.5, r = 5.5, b = 30, l = 5.5)) +
+                                   guides(fill = guide_colourbar(order = 2,
+                                                                 barwidth = unit(35, "mm"),
+                                                                 barheight = unit(8, "pt")),
+                                          size = guide_legend(order = 1,
+                                                              keywidth = unit(17.5, "pt"),
+                                                              label.position = "bottom",
+                                                              label.theme = element_text(size = 8, margin = margin(t = -5, 0, 0, 0)))),
+                          NULL, f3b, nrow = 1,
+                          widths = c(48.75, 2.5, 48.75), labels = c("(a)", "", "(b)"), hjust = 0),
+                ggarrange(heatmaps_WTvsKO$color_key + mod, heatmap_legend, nrow = 1, widths = c(15, 85)),
+                ggarrange(f3c, NULL, f3d, nrow = 1, widths = c(48.75, 2.5, 48.75), labels = c("(c)", "", "(d)"), hjust = 0),
+                nrow = 3, heights = c(45, 10, 45))
+
+# ggsave("f3.pdf", f3, device = "pdf", path = "figures/", width = 180, height = 220, units = "mm")
+
+pdf("figures/f3.pdf", width = 180/25.4, height = 242/25.4)  # 1 in = 25.4 mm
+
+f3
+grid.text("-3", x = unit(3.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-2", x = unit(6.9, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-1", x = unit(10, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("0", x = unit(13.55, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("1", x = unit(16.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("2", x = unit(19.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("3", x = unit(23, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+
+dev.off()
+
+
+
+
+f3_named <- f3 + theme(plot.margin = margin(t = 20, unit = "mm"))
+
+f3_named <- annotate_figure(f3_named, fig.lab = "Figure 3", fig.lab.size = 25)
+
+pdf("figures/f3_named.pdf", width = 180/25.4, height = 242/25.4 + 20/25.4)  # 1 in = 25.4 mm
+
+f3_named
+grid.text("-3", x = unit(3.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-2", x = unit(6.9, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-1", x = unit(10, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("0", x = unit(13.55, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("1", x = unit(16.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("2", x = unit(19.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("3", x = unit(23, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+
+dev.off()
+
+
+```
+
+### Heatmaps WTvsKO (v2)
+
+```{r}
+####### Selected terms to plot in heatmaps:
+# ECM = CC	GO:0031012	Extracellular matrix
+# cardiovascular = BP	GO:0007507	Heart development
+# somatotroph_axis = BP	GO:0070848	Response to growth factor
+# BMP = BP	GO:0071772	Response to BMP
+# calcium = MF	GO:0005509	Calcium ion binding
+# vegf = BP	GO:0048010 vascular endothelial growth factor receptor signaling pathway
+# notch GO:0007219	Notch signaling pathway
+
+go_IDs <- c("GO:0031012", "GO:0007507", "GO:0070848", "GO:0071772", "GO:0005509", "GO:0048010", "GO:0007219", "GO:0001756", "GO:0003007")
+go_names <- c("Extracellular matrix",
+              "Heart development",
+              "Response to growth factor",
+              "Response to BMP",
+              "Calcium ion binding",
+              "VEGFR signaling pathway",
+              "Notch signaling pathway",
+              "Somitogenesis",
+              "Heart morphogenesis")
+# cex_vals <- c(0.9, 1, 1, 1, 0.9, 1, 1, 1, 1)
+
+
+make_heatmaps_WTvsKO <- function() {
+  
+  heatmaps_list <- list()
+  laki <- mice_uniovi$model == "laki"
+  face <- mice_uniovi$model == "zmpste"
+  
+  for (i in seq_along(go_IDs)) {
+    
+    gene_list <- data.frame(gene_symbol = unlist(stringr::str_split(go@result$geneID[go@result$ID == go_IDs[i]],
+                                                                    pattern = "/"))) %>% 
+      dplyr::left_join(tab[, c("AptName", "Target", "EntrezGeneSymbol", "P.value.adj.KOvWT")],
+                       by = c("gene_symbol" = "EntrezGeneSymbol")) %>% 
+      dplyr::filter(P.value.adj.KOvWT < 0.05)
+    
+    df <- mice_uniovi
+    rownames(df) <- paste(df$id, df$genotype, sep = "_")
+    mat <- df %>% 
+             dplyr::select(gene_list$AptName) %>% 
+             as.matrix()
+    
+    mat_scaled <- scale(mat)
+    
+    row_dist <- as.dist(1-cor(mat))
+    row_hclust <- hclust(row_dist, method = "ward.D2")
+    row_medians <- matrixStats::colMedians(mat)
+    row_dendrogram <- reorder(as.dendrogram(row_hclust), row_medians, agglo.FUN = median)
+    row_names <- gene_list$gene_symbol
+    
+    
+    # LAKI
+    
+    col_dist <- dist(mat[laki, ], method = "euclidean")
+    col_hclust <- hclust(col_dist, method = "ward.D2")
+    col_medians <- matrixStats::rowMedians(mat[laki, ])
+    col_dendrogram <- reorder(as.dendrogram(col_hclust), col_medians, agglo.FUN = median)
+    col_dendrogram <- dendextend::rotate(col_dendrogram, c(grep("WT", as.hclust(col_dendrogram)$labels, value = TRUE),
+                                                           grep("KO", as.hclust(col_dendrogram)$labels, value = TRUE)))
+    
+    
+    mat_laki <- mat_scaled[laki, ]
+    heatmap_colors <- ifelse(mice_uniovi[mice_uniovi$model == "laki", ]$genotype == "WT", colors$LakiWT, colors$LakiKO)
+    
+    
+    if(i == 1){
+
+      color_key <- ~heatmap.2(t(mat_scaled),
+                              dendrogram = "none",
+                              scale = "none",
+                              breaks = color_breaks,
+                              symbreaks = TRUE,
+                              col = palette_heatmap,
+                              trace = "none",
+                              margins = c(.01, .01),
+                              labCol = "",
+                              key = TRUE,
+                              keysize = 0.1,
+                              density.info = "none",
+                              symkey = TRUE,
+                              key.title = "Z-score",
+                              key.xlab = "",
+                              # key.par = list(cex = 1.8),
+                              lwid = c(0.6, 0.1),
+                              lhei = c(0.7, 0.01)
+      )
+
+      color_key <- base2grob(color_key)
+
+      to_rm <- c("graphics-plot-1-bottom-axis-labels-1",
+                 "graphics-plot-1-image-rect-1",
+                 "graphics-plot-1-right-axis-labels-1",
+                 "graphics-plot-1-text-1",
+                 "graphics-plot-1-xlab-1",
+                 "graphics-plot-1-ylab-1",
+                 "graphics-plot-4-bottom-axis-line-1",
+                 "graphics-plot-4-mtext-bottom-1",
+                 "graphics-plot-4-xlab-1",
+                 "graphics-plot-4-ylab-1" )
+      
+
+      for (j in to_rm) {
+          
+          color_key <- removeGrob(color_key, j, grep = TRUE,
+                                  global = FALSE)
+
+      }
+        
+      x_labels <- getGrob(color_key, "graphics-plot-4-bottom-axis-labels-1")
+      x_labels <- editGrob(x_labels, gp = gpar(ps = 8))
+      
+      color_key <- setGrob(gTree = color_key, 
+                           gPath = "graphics-plot-4-bottom-axis-labels-1",
+                           newGrob = x_labels)
+      
+      # Increase box line width
+      
+      box <- getGrob(color_key, "graphics-plot-4-box-1")
+      box <- editGrob(box, gp = gpar(lwd = unit(2, "pt")))
+      
+      color_key <- setGrob(gTree = color_key, 
+                           gPath = "graphics-plot-4-box-1",
+                           newGrob = box)
+      
+      
+      color_key <- as.ggplot(color_key)
+
+      heatmaps_list[[length(go_IDs) + 1]] <- color_key
+      names(heatmaps_list)[length(go_IDs) + 1] <- "color_key"
+
+    }
+    
+    
+    ht1 <- ~heatmap.2(t(mat_laki),
+                      Rowv = row_dendrogram,
+                      Colv = col_dendrogram,
+                      hclustfun = my_hclust,
+                      dendrogram = "column",
+                      reorderfun = function(d, w) reorder(d, w, agglo.FUN = median),
+                      scale = "none",
+                      breaks = color_breaks,
+                      symbreaks = TRUE,
+                      col = palette_heatmap,
+                      trace = "none",
+                      margins = c(1, 1),
+                      ColSideColor = heatmap_colors,
+                      labRow = "",
+                      labCol = "",
+                      key = FALSE,
+                      density.info = "none",
+                      lwid = c(0.01, 1),
+                      # lwid = c(0.1, 1)  # when adding gene/protein names
+                      lhei = c(1, 9)
+    )
+    
+    ht1 <- base2grob(ht1)
+    to_rm <- c("graphics-plot-1-xlab-1",
+               "graphics-plot-1-ylab-1",
+               "graphics-plot-2-bottom-axis-labels-1",
+               "graphics-plot-2-right-axis-labels-1",
+               "graphics-plot-2-text-1",
+               "graphics-plot-2-xlab-1",
+               "graphics-plot-2-ylab-1",
+               "graphics-plot-4-xlab-1",
+               "graphics-plot-4-ylab-1")
+    
+    
+    for (j in to_rm) {
+      ht1 <- removeGrob(ht1, j, grep = TRUE,
+                        global = FALSE)
+    }
+    
+    ht1 <- as.ggplot(ht1)
+    
+    
+    # FACE
+    
+    col_dist <- dist(mat[face, ], method = "euclidean")
+    col_hclust <- hclust(col_dist, method = "ward.D2")
+    col_medians <- rowMedians(mat[face, ])
+    col_dendrogram <- reorder(as.dendrogram(col_hclust), col_medians, agglo.FUN = median)
+    col_dendrogram <- dendextend::rotate(col_dendrogram, c(grep("WT", as.hclust(col_dendrogram)$labels, value = TRUE),
+                                                           grep("KO", as.hclust(col_dendrogram)$labels, value = TRUE)))
+    
+    mat_face <- mat_scaled[face, ]
+    heatmap_colors <- ifelse(mice_uniovi[mice_uniovi$model == "zmpste", ]$genotype == "WT",
+                             colors$ZmpsteWT, colors$ZmpsteKO)
+    
+    
+    ht2 <- ~heatmap.2(t(mat_face),
+                      Rowv = row_dendrogram,
+                      Colv = col_dendrogram,
+                      hclustfun = my_hclust,
+                      dendrogram = "column",
+                      reorderfun = function(d, w) reorder(d, w, agglo.FUN = median),
+                      scale = "none",
+                      breaks = color_breaks,
+                      symbreaks = TRUE,
+                      col = palette_heatmap,
+                      trace = "none",
+                      # margins = c(1, 1),
+                      margins = c(1, 19),
+                      # margins = c(1, 19),  # to add gene/protein names on the right side
+                      ColSideColor = heatmap_colors,
+                      # cexRow = cex_vals[i],
+                      cexRow = 0.5,
+                      labRow = row_names,
+                      labCol = "",
+                      offsetRow = -0.2,
+                      key = FALSE,
+                      density.info = "none",
+                      lwid = c(0.01, 9),
+                      # lwid = c(0.01, 9)   # when adding gene/protein names
+                      lhei = c(1, 9)
+    )
+    
+    
+    ht2 <- base2grob(ht2)
+    to_rm <- c("graphics-plot-1-xlab-1",
+               "graphics-plot-1-ylab-1",
+               "graphics-plot-2-bottom-axis-labels-1",
+               # "graphics-plot-2-right-axis-labels-1",    # comment to keep gene/protein names
+               "graphics-plot-2-text-1",
+               "graphics-plot-2-xlab-1",
+               "graphics-plot-2-ylab-1",
+               "graphics-plot-4-xlab-1",
+               "graphics-plot-4-ylab-1")
+    
+      
+    for (j in to_rm) {
+      ht2 <- removeGrob(ht2, j, grep = TRUE, global = FALSE)
+    }
+    
+    ht2 <- as.ggplot(ht2)
+    
+    
+    
+    ht_title <- text_grob(go_names[i], size = 12, x = 0.415, face = "bold")
+                                                # x = 0.415  # when adding gene/protein names
+                          
+
+    ht_title <- as_ggplot(ht_title) + theme(plot.margin = margin(0, 0, 3, 0))
+    
+    
+    
+    hts <- ggarrange(ht1, ht2,
+                     widths = c(39.7, 60.3)
+                     )
+    
+    ht <- ggarrange(ht_title, hts, nrow = 2, heights = c(10, 90))
+    
+    heatmaps_list[[i]] <- ht
+    names(heatmaps_list)[i] <- go_names[i]
+    
+  }
+  
+  return(heatmaps_list)
+
+}
+
+heatmaps_WTvsKO <- make_heatmaps_WTvsKO()
+
+```
+
+
+
+```{r}
+f3b <- heatmaps_WTvsKO$`Extracellular matrix`
+f3c <- heatmaps_WTvsKO$`Response to growth factor`
+f3d <- heatmaps_WTvsKO$`Calcium ion binding`
+
+mod <- theme(plot.margin = margin(11, 0, 11, 5),
+             text = element_text(size = 8),
+             axis.ticks.length = unit(1, "pt")
+)
+
+
+f3 <- ggarrange(ggarrange(f3a + theme(legend.position = c(0, 0),
+                                         legend.box = "horizontal",
+                                         legend.direction = "horizontal",
+                                         legend.box.margin = margin(t = -5, r = 15, b = -90, l = -160),
+                                         legend.margin = margin(r = 5.5, l = 5.5),
+                                         legend.justification = 0,
+                                         legend.spacing.x = unit(2, "pt"),
+                                         legend.spacing.y = unit(5, "pt"),
+                                         legend.text = element_text(size = 8, margin = margin(t = 0)),
+                                         legend.title = element_text(size = 10, vjust = 0.9),
+                                         plot.margin = margin(t = 5.5, r = 5.5, b = 30, l = 5.5)) +
+                                   guides(fill = guide_colourbar(order = 2,
+                                                                 barwidth = unit(35, "mm"),
+                                                                 barheight = unit(8, "pt")),
+                                          size = guide_legend(order = 1,
+                                                              keywidth = unit(17.5, "pt"),
+                                                              label.position = "bottom",
+                                                              label.theme = element_text(size = 8, margin = margin(t = -5, 0, 0, 0)))),
+                          NULL, f3b, nrow = 1,
+                          widths = c(48.75, 2.5, 48.75), labels = c("(a)", "", "(b)"), hjust = 0),
+                ggarrange(heatmaps_WTvsKO$color_key + mod, heatmap_legend, nrow = 1, widths = c(15, 85)),
+                ggarrange(f3c, NULL, f3d, nrow = 1, widths = c(48.75, 2.5, 48.75), labels = c("(c)", "", "(d)"), hjust = 0),
+                nrow = 3, heights = c(45, 5, 45))
+
+# ggsave("f3.pdf", f3, device = "pdf", path = "figures/", width = 180, height = 220, units = "mm")
+
+pdf("figures/f3.pdf", width = 180/25.4, height = 242/25.4)  # 1 in = 25.4 mm
+
+f3
+grid.text("-3", x = unit(3.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-2", x = unit(6.9, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-1", x = unit(10, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("0", x = unit(13.55, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("1", x = unit(16.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("2", x = unit(19.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("3", x = unit(23, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+
+dev.off()
+
+
+
+
+f3_named <- f3 + theme(plot.margin = margin(t = 20, unit = "mm"))
+
+f3_named <- annotate_figure(f3_named, fig.lab = "Figure 3", fig.lab.size = 25)
+
+pdf("figures/f3_named.pdf", width = 180/25.4, height = 242/25.4 + 20/25.4)  # 1 in = 25.4 mm
+
+f3_named
+grid.text("-3", x = unit(3.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-2", x = unit(6.9, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("-1", x = unit(10, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("0", x = unit(13.55, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("1", x = unit(16.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("2", x = unit(19.7, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+grid.text("3", x = unit(23, "mm"), y = unit(115.5, "mm"), gp = gpar(fontsize = 7))
+
+dev.off()
+
+
+```
+
+### Heatmaps by model
+
+```{r}
+# heatmaps built with genes from the comparison from each model
+
+make_heatmaps_model <- function(model) {
+  
+  if (model == "LAKI") {
+    
+    pvals_column <- "P.value.adj.LAKI_KOvWT"
+    go_results <- go_laki@result
+    df <- mice_uniovi %>% 
+              dplyr::filter(model == "laki")
+    heatmap_colors <- ifelse(df$genotype == "WT", colors$LakiWT, colors$LakiKO)
+    
+  } else if (model == "FACE") {
+    
+    pvals_column <- "P.value.adj.ZMPSTE_KOvWT"
+    go_results <- go_face@result
+    df <- mice_uniovi %>% 
+              dplyr::filter(model == "zmpste")
+    heatmap_colors <- ifelse(df$genotype == "WT", colors$ZmpsteWT, colors$ZmpsteKO)
+    
+  } else {
+    
+    stop("Model not found")
+    
+  }
+  
+  rownames(df) <- paste(df$id, df$genotype, sep = "_")
+  
+  hts <- list()
+  
+  for (i in 1:length(go_IDs)) {
+    
+    gene_list <- data.frame(gene_symbol = unlist(stringr::str_split(go_results$geneID[go_results$ID == go_IDs[i]],
+                                                                    pattern = "/"))) %>% 
+      dplyr::left_join(tab[, c("AptName", "Target", "EntrezGeneSymbol", pvals_column)],
+                       by = c("gene_symbol" = "EntrezGeneSymbol")) %>% 
+      dplyr::filter(.[[pvals_column]] < 0.05)
+    
+    
+    mat <- df %>% 
+             dplyr::select(gene_list$AptName) %>% 
+             as.matrix()
+    
+    mat_scaled <- scale(mat)
+    
+    row_dist <- as.dist(1-cor(mat))
+    row_hclust <- hclust(row_dist, method = "ward.D2")
+    row_medians <- matrixStats::colMedians(mat)
+    row_dendrogram <- reorder(as.dendrogram(row_hclust), row_medians, agglo.FUN = median)
+    row_names <- gene_list$Target
+    
+    
+    col_dist <- dist(mat, method = "euclidean")
+    col_hclust <- hclust(col_dist, method = "ward.D2")
+    col_medians <- matrixStats::rowMedians(mat)
+    col_dendrogram <- reorder(as.dendrogram(col_hclust), col_medians, agglo.FUN = median)
+    col_dendrogram <- dendextend::rotate(col_dendrogram, c(grep("WT", as.hclust(col_dendrogram)$labels, value = TRUE),
+                                                           grep("KO", as.hclust(col_dendrogram)$labels, value = TRUE)))
+    
+    
+    ht <- ~heatmap.2(t(mat_scaled),
+                     Rowv = row_dendrogram,
+                     Colv = col_dendrogram,
+                     hclustfun = my_hclust,
+                     dendrogram = "column",
+                     reorderfun = function(d, w) reorder(d, w, agglo.FUN = median),
+                     scale = "none",
+                     breaks = color_breaks,
+                     symbreaks = TRUE,
+                     col = palette_heatmap,
+                     trace = "none",
+                     margins = c(1, 10),
+                     # margins = c(1, 19),  # when adding gene/protein names
+                     ColSideColor = heatmap_colors,
+                     cexRow = 1.7,
+                     labRow = "",
+                     # labRow = row_names,  # when adding gene/protein names
+                     labCol = "",
+                     key = FALSE,
+                     density.info = "none",
+                     # lwid = c(0.01, 9)
+                     lwid = c(0.01, 1)
+                      # lwid = c(0.1, 1)  # when adding gene/protein names
+    )
+
+    ht <- base2grob(ht)
+    
+    to_rm <- c("graphics-plot-1-xlab-1",
+               "graphics-plot-1-ylab-1",
+               "graphics-plot-2-bottom-axis-labels-1",
+               "graphics-plot-2-right-axis-labels-1", # to rm gene/protein names
+               "graphics-plot-2-text-1",
+               "graphics-plot-2-xlab-1",
+               "graphics-plot-2-ylab-1",
+               "graphics-plot-4-xlab-1",
+               "graphics-plot-4-ylab-1")
+    
+
+    
+    
+    for (j in to_rm) {
+      ht <- removeGrob(ht, j, grep = TRUE,
+                       global = FALSE)
+    }
+    
+    ht <- as.ggplot(ht)
+    
+    
+    
+    
+    ht_title <- text_grob(go_names[i], size = 12, x = 0.5)
+                                                  # x = 0.32  when adding gene/protein names
+    
+    ht_title <- as_ggplot(ht_title) + theme(plot.margin = margin(0, 0, 3, 0))
+    
+    
+    ht <- ggarrange(ht_title, ht, nrow = 2, heights = c(10, 90))
+    
+    
+    hts[[i]] <- ht
+    names(hts)[i] <- go_names[i]
+    
+  }
+  
+  return(hts)
+  
+}
+
+heatmaps_laki <- make_heatmaps_model("LAKI")
+heatmaps_face <- make_heatmaps_model("FACE")
+
+```
+
+```{r}
+
+s3c <- heatmaps_laki$`Heart morphogenesis`
+s3d <- heatmaps_face$`Heart morphogenesis`
+s3e <- heatmaps_laki$`Notch signaling pathway`
+s3f <- heatmaps_face$`Notch signaling pathway`
+
+mod_theme <- theme(
+             legend.box = "horizontal",
+             legend.direction = "horizontal",
+             legend.text = element_text(size = 8, margin = margin(t = 0)),
+             legend.title = element_text(size = 10, vjust = 0.9),
+             plot.margin = margin(t = 5.5, r = 5.5, b = 0, l = 5.5)
+             )
+
+
+mod_guides <- guides(fill = guide_colourbar(order = 2,
+                                     barwidth = unit(50, "mm"),
+                                     barheight = unit(10, "pt")),
+                     size = guide_legend(order = 1,
+                                         keywidth = unit(17.5, "pt"),
+                                         label.position = "bottom",
+                                         label.theme = element_text(size = 8, margin = margin(t = -5))))
+
+
+s3 <- ggarrange(ggarrange(s3a + mod_theme + mod_guides, NULL, s3b + mod_theme + mod_guides,
+                          labels = c("(a)", "", "(b)"), hjust = 0, widths = c(47.5, 5, 47.5),
+                          nrow = 1, legend = "bottom", common.legend = TRUE),
+                NULL,
+                ggarrange(NULL,
+                          heatmap_legend_laki,
+                          heatmaps_WTvsKO$color_key + theme(plot.margin = margin(t = 35, r = 10, b = -35, l = 10)),
+                          heatmap_legend_face,
+                          NULL,
+                          nrow = 1, widths = c(7.5, 32.5, 20, 32.5, 7.5)),
+                NULL,
+                ggarrange(s3c, NULL, s3d, labels = c("(c)", "", "(d)"), hjust = 0, label.y = 1.16,
+                          widths = c(47.5, 5, 47.5), nrow = 1),
+                NULL,
+                ggarrange(s3e, NULL, s3f, labels = c("(e)", "", "(f)"), hjust = 0, widths = c(47.5, 5, 47.5), nrow = 1),
+                nrow = 7, heights = c(35, 2, 3, 1, 28.5, 2, 28.5))
+                          
+                          
+
+# ggsave("s3.pdf", s3, device = "pdf", path = "figures/", width = 180, height = 242, units = "mm")
+
+
+pdf("figures/s3.pdf", width = 180/25.4, height = 242/25.4)  # 1 in = 25.4 mm
+
+s3
+grid.text("-3", x = unit(77.5, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("-2", x = unit(81.2, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("-1", x = unit(84.8, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("0", x = unit(89, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("1", x = unit(92.6, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("2", x = unit(96.3, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("3", x = unit(99.7, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+
+dev.off()
+```
+
+```{r}
+cardiovascular_aptamers <- c(
+"seq.6367.66",
+"seq.3714.49",
+"seq.9756.6",
+"seq.21670.52",
+"seq.8982.65",
+"seq.2670.67",
+"seq.6520.87",
+"seq.3419.49",
+"seq.17347.80",
+"seq.3236.12",
+"seq.6645.53",
+"seq.20093.9",
+"seq.4912.17",
+"seq.15414.316",
+"seq.5315.22",
+"seq.5441.67",
+"seq.3042.7",
+"seq.7655.11",
+"seq.5756.66",
+"seq.4374.45",
+"seq.4337.49",
+"seq.6447.73",
+"seq.4673.13",
+"seq.5316.54",
+"seq.2609.59",
+"seq.2796.62",
+"seq.4907.56",
+"seq.3554.24",
+"seq.5729.27",
+"seq.12077.32",
+"seq.3066.12",
+"seq.2211.9",
+"seq.13113.7",
+"seq.23903.3",
+"seq.4157.2")
+
+cardiovascular_pca <- mice_uniovi %>% 
+                          dplyr::select(all_of(cardiovascular_aptamers)) %>% 
+                          as.matrix() %>% 
+                          t()
+
+res.pca_cardiovascular <- prcomp(t(cardiovascular_pca),  scale = T) # Calculates PCA
+g <- fviz_pca_ind(res.pca_cardiovascular, label="none", habillage=paste0(mice_uniovi$model, mice_uniovi$genotype), pointsize = 2.5, invisible="quali") + 
+  theme_bw() +
+  theme(text = element_text(size = 18),
+        legend.text=element_markdown(),
+        legend.text.align = 0, 
+        panel.grid = element_blank())+
+  scale_color_manual(name = "Genotype",
+                     values = c(colors$LakiKO, colors$LakiWT, colors$ZmpsteKO, colors$ZmpsteWT),
+                     labels = c("<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>")) +
+  scale_shape_manual(name = "Genotype", values = c(15,15,17,17), labels = c("<i>Lmna<sup>G609G/G609G</sup></i>",
+                                                                            "<i>Lmna<sup>+/+</sup></i>",
+                                                                            "<i>Zmpste24<sup>-/-</sup></i>",
+                                                                            "<i>Zmpste24<sup>+/+</sup></i>")) + 
+  ggtitle(NULL) #Plots PCA, habillage argument will color points by cohort
+
+```
+
+
+### Heatmaps by model (v2)
+
+```{r}
+# heatmaps built with genes from the comparison from each model
+
+make_heatmaps_model <- function(model) {
+  
+  if (model == "LAKI") {
+    
+    pvals_column <- "P.value.adj.LAKI_KOvWT"
+    go_results <- go_laki@result
+    df <- mice_uniovi %>% 
+              dplyr::filter(model == "laki")
+    heatmap_colors <- ifelse(df$genotype == "WT", colors$LakiWT, colors$LakiKO)
+    cex_val = 0.5
+    
+  } else if (model == "FACE") {
+    
+    pvals_column <- "P.value.adj.ZMPSTE_KOvWT"
+    go_results <- go_face@result
+    df <- mice_uniovi %>% 
+              dplyr::filter(model == "zmpste")
+    heatmap_colors <- ifelse(df$genotype == "WT", colors$ZmpsteWT, colors$ZmpsteKO)
+    cex_val = 1
+    
+  } else {
+    
+    stop("Model not found")
+    
+  }
+  
+  rownames(df) <- paste(df$id, df$genotype, sep = "_")
+  
+  hts <- list()
+  
+  for (i in 1:length(go_IDs)) {
+    
+    gene_list <- data.frame(gene_symbol = unlist(stringr::str_split(go_results$geneID[go_results$ID == go_IDs[i]],
+                                                                    pattern = "/"))) %>% 
+      dplyr::left_join(tab[, c("AptName", "Target", "EntrezGeneSymbol", pvals_column)],
+                       by = c("gene_symbol" = "EntrezGeneSymbol")) %>% 
+      dplyr::filter(.[[pvals_column]] < 0.05)
+    
+    
+    mat <- df %>% 
+             dplyr::select(gene_list$AptName) %>% 
+             as.matrix()
+    
+    mat_scaled <- scale(mat)
+    
+    row_dist <- as.dist(1-cor(mat))
+    row_hclust <- hclust(row_dist, method = "ward.D2")
+    row_medians <- matrixStats::colMedians(mat)
+    row_dendrogram <- reorder(as.dendrogram(row_hclust), row_medians, agglo.FUN = median)
+    row_names <- gene_list$gene_symbol
+    
+    
+    col_dist <- dist(mat, method = "euclidean")
+    col_hclust <- hclust(col_dist, method = "ward.D2")
+    col_medians <- matrixStats::rowMedians(mat)
+    col_dendrogram <- reorder(as.dendrogram(col_hclust), col_medians, agglo.FUN = median)
+    col_dendrogram <- dendextend::rotate(col_dendrogram, c(grep("WT", as.hclust(col_dendrogram)$labels, value = TRUE),
+                                                           grep("KO", as.hclust(col_dendrogram)$labels, value = TRUE)))
+    
+    
+    ht <- ~heatmap.2(t(mat_scaled),
+                     Rowv = row_dendrogram,
+                     Colv = col_dendrogram,
+                     hclustfun = my_hclust,
+                     dendrogram = "column",
+                     reorderfun = function(d, w) reorder(d, w, agglo.FUN = median),
+                     scale = "none",
+                     breaks = color_breaks,
+                     symbreaks = TRUE,
+                     col = palette_heatmap,
+                     trace = "none",
+                     # margins = c(1, 1),
+                     margins = c(1, 10),  # when adding gene/protein names
+                     ColSideColor = heatmap_colors,
+                     cexRow = cex_val,
+                     offsetRow = -0.2,
+                     # labRow = "",
+                     labRow = row_names,  # when adding gene/protein names
+                     labCol = "",
+                     key = FALSE,
+                     density.info = "none",
+                     # lwid = c(0.01, 9)
+                     # lwid = c(0.01, 1)
+                      lwid = c(0.1, 9)  # when adding gene/protein names
+    )
+
+    ht <- base2grob(ht)
+    
+    to_rm <- c("graphics-plot-1-xlab-1",
+               "graphics-plot-1-ylab-1",
+               "graphics-plot-2-bottom-axis-labels-1",
+               # "graphics-plot-2-right-axis-labels-1", # to rm gene/protein names
+               "graphics-plot-2-text-1",
+               "graphics-plot-2-xlab-1",
+               "graphics-plot-2-ylab-1",
+               "graphics-plot-4-xlab-1",
+               "graphics-plot-4-ylab-1")
+    
+
+    
+    
+    for (j in to_rm) {
+      ht <- removeGrob(ht, j, grep = TRUE,
+                       global = FALSE)
+    }
+    
+    ht <- as.ggplot(ht)
+    
+    
+    
+    
+    ht_title <- text_grob(go_names[i], size = 12, x = 0.43, face = "bold")
+
+    ht_title <- as_ggplot(ht_title) + theme(plot.margin = margin(0, 0, 3, 0))
+    
+    
+    ht <- ggarrange(ht_title, ht, nrow = 2, heights = c(10, 90))
+    
+    
+    hts[[i]] <- ht
+    names(hts)[i] <- go_names[i]
+    
+  }
+  
+  return(hts)
+  
+}
+
+heatmaps_laki <- make_heatmaps_model("LAKI")
+heatmaps_face <- make_heatmaps_model("FACE")
+
+```
+
+```{r}
+
+s3c <- heatmaps_laki$`Heart morphogenesis`
+s3d <- heatmaps_face$`Heart morphogenesis`
+s3e <- heatmaps_laki$`Notch signaling pathway`
+s3f <- heatmaps_face$`Notch signaling pathway`
+
+mod_theme <- theme(
+             legend.box = "horizontal",
+             legend.direction = "horizontal",
+             legend.text = element_text(size = 8, margin = margin(t = 0)),
+             legend.title = element_text(size = 10, vjust = 0.9),
+             plot.margin = margin(t = 5.5, r = 5.5, b = 0, l = 5.5)
+             )
+
+
+mod_guides <- guides(fill = guide_colourbar(order = 2,
+                                     barwidth = unit(50, "mm"),
+                                     barheight = unit(10, "pt")),
+                     size = guide_legend(order = 1,
+                                         keywidth = unit(17.5, "pt"),
+                                         label.position = "bottom",
+                                         label.theme = element_text(size = 8, margin = margin(t = -5))))
+
+
+s3 <- ggarrange(ggarrange(s3a + mod_theme + mod_guides, NULL, s3b + mod_theme + mod_guides,
+                          labels = c("(a)", "", "(b)"), hjust = 0, widths = c(47.5, 5, 47.5),
+                          nrow = 1, legend = "bottom", common.legend = TRUE),
+                NULL,
+                ggarrange(NULL,
+                          heatmap_legend_laki,
+                          heatmaps_WTvsKO$color_key + theme(plot.margin = margin(t = 35, r = 10, b = -35, l = 10)),
+                          heatmap_legend_face,
+                          NULL,
+                          nrow = 1, widths = c(7.5, 32.5, 20, 32.5, 7.5)),
+                NULL,
+                ggarrange(s3c, NULL, s3d, labels = c("(c)", "", "(d)"), hjust = 0, label.y = 1.16,
+                          widths = c(47.5, 5, 47.5), nrow = 1),
+                NULL,
+                ggarrange(s3e, NULL, s3f, labels = c("(e)", "", "(f)"), hjust = 0, widths = c(47.5, 5, 47.5), nrow = 1),
+                nrow = 7, heights = c(35, 2, 3, 1, 28.5, 2, 28.5))
+                          
+                          
+
+# ggsave("s3.pdf", s3, device = "pdf", path = "figures/", width = 180, height = 242, units = "mm")
+
+
+pdf("figures/s3.pdf", width = 180/25.4, height = 242/25.4)  # 1 in = 25.4 mm
+
+s3
+grid.text("-3", x = unit(77.5, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("-2", x = unit(81.2, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("-1", x = unit(84.8, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("0", x = unit(89, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("1", x = unit(92.6, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("2", x = unit(96.3, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+grid.text("3", x = unit(99.7, "mm"), y = unit(131, "mm"), gp = gpar(fontsize = 7))
+
+dev.off()
+```
+
+```{r}
+cardiovascular_aptamers <- c(
+"seq.6367.66",
+"seq.3714.49",
+"seq.9756.6",
+"seq.21670.52",
+"seq.8982.65",
+"seq.2670.67",
+"seq.6520.87",
+"seq.3419.49",
+"seq.17347.80",
+"seq.3236.12",
+"seq.6645.53",
+"seq.20093.9",
+"seq.4912.17",
+"seq.15414.316",
+"seq.5315.22",
+"seq.5441.67",
+"seq.3042.7",
+"seq.7655.11",
+"seq.5756.66",
+"seq.4374.45",
+"seq.4337.49",
+"seq.6447.73",
+"seq.4673.13",
+"seq.5316.54",
+"seq.2609.59",
+"seq.2796.62",
+"seq.4907.56",
+"seq.3554.24",
+"seq.5729.27",
+"seq.12077.32",
+"seq.3066.12",
+"seq.2211.9",
+"seq.13113.7",
+"seq.23903.3",
+"seq.4157.2")
+
+cardiovascular_pca <- mice_uniovi %>% 
+                          dplyr::select(all_of(cardiovascular_aptamers)) %>% 
+                          as.matrix() %>% 
+                          t()
+
+res.pca_cardiovascular <- prcomp(t(cardiovascular_pca),  scale = T) # Calculates PCA
+g <- fviz_pca_ind(res.pca_cardiovascular, label="none", habillage=paste0(mice_uniovi$model, mice_uniovi$genotype), pointsize = 2.5, invisible="quali") + 
+  theme_bw() +
+  theme(text = element_text(size = 18),
+        legend.text=element_markdown(),
+        legend.text.align = 0, 
+        panel.grid = element_blank())+
+  scale_color_manual(name = "Genotype",
+                     values = c(colors$LakiKO, colors$LakiWT, colors$ZmpsteKO, colors$ZmpsteWT),
+                     labels = c("<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>")) +
+  scale_shape_manual(name = "Genotype", values = c(15,15,17,17), labels = c("<i>Lmna<sup>G609G/G609G</sup></i>",
+                                                                            "<i>Lmna<sup>+/+</sup></i>",
+                                                                            "<i>Zmpste24<sup>-/-</sup></i>",
+                                                                            "<i>Zmpste24<sup>+/+</sup></i>")) + 
+  ggtitle(NULL) #Plots PCA, habillage argument will color points by cohort
+
+```
+
+
+### PCAs Disease Ontology
+
+```{r}
+
+gene_sets <- list.files(path="/home/diego/SomaScan/Disease_Ontology", pattern="*.txt", recursive=FALSE, full.names=TRUE)
+gene_sets_names <- list.files(path="/home/diego/SomaScan/Disease_Ontology", pattern="*.txt", recursive=FALSE)
+
+
+make_PCAs <- function() {
+    
+    PCAs <- list(raw_group = list(), raw_batch = list(),
+                 corrected_group = list(), corrected_sex = list(), corrected_batch = list())
+    
+    for(i in seq_along(gene_sets)){
+        
+        df <- read.table(gene_sets[i]) %>% 
+            dplyr::rename(EntrezGeneSymbol = V1) %>% 
+            dplyr::left_join(analytes[, c("EntrezGeneSymbol", "AptName")], by = "EntrezGeneSymbol", multiple = "all") %>% 
+            dplyr::filter(!is.na(AptName))
+        
+        aptamers <- df %>% 
+            dplyr::pull(AptName)
+        genes    <- df %>% 
+            dplyr::pull(EntrezGeneSymbol) %>% 
+            unique()
+        
+        
+        if(length(aptamers) > 2) {
+            
+            # Raw
+            
+            pca <- mice_uniovi %>% 
+                dplyr::select(all_of(aptamers)) %>% 
+                as.matrix()
+            
+            res.pca <- prcomp(pca,  scale = TRUE)
+            
+            
+            disease_name <- gsub(".txt", "", gene_sets_names[i])
+            plot_title <-  disease_name
+            plot_subtitle <- paste0("Aptamers: ", length(aptamers), ", unique genes: ", length(genes))
+            
+            g <- fviz_pca_ind(res.pca, label="none",
+                              habillage = factor(interaction(mice_uniovi$genotype, mice_uniovi$model), levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                              fill =      factor(interaction(mice_uniovi$genotype, mice_uniovi$model), levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                              stroke = 1, pointsize = 1, invisible = "quali") + 
+                theme_bw() +
+                theme(text = element_text(size = 15),
+                      # plot.title = element_markdown(size = 15, hjust = 0.5, vjust = 0.5),
+                      legend.text = element_markdown(),
+                      legend.text.align = 0,
+                      panel.grid = element_blank()) +
+                scale_color_manual(name = "Genotype",
+                                   values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO),
+                                                     c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                              "<i>Zmpste24<sup>+/+</sup></i>",
+                                              "<i>Zmpste24<sup>-/-</sup></i>")) +
+                scale_shape_manual(name = "Genotype",
+                                   values = setNames(c(22, 22, 24, 24),
+                                                     c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                              "<i>Zmpste24<sup>+/+</sup></i>",
+                                              "<i>Zmpste24<sup>-/-</sup></i>")) + 
+                scale_fill_manual(name = "Genotype",
+                                  values = setNames(c("white", colors$LakiKO, "white", colors$ZmpsteKO),
+                                                    c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                  labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                             "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                             "<i>Zmpste24<sup>+/+</sup></i>",
+                                             "<i>Zmpste24<sup>-/-</sup></i>")) +
+                labs(title = plot_title,
+                     subtitle = plot_subtitle)
+            
+            g$labels$x <- stringr::str_replace(g$labels$x, "Dim", "PC")
+            g$labels$y <- stringr::str_replace(g$labels$y, "Dim", "PC")
+            
+            PCAs$raw_group[[i]] <- g
+            names(PCAs$raw_group)[i] <- disease_name
+            
+            
+            g <- fviz_pca_ind(res.pca, label="none",
+                              habillage=mice_uniovi$cohort,
+                              fill = mice_uniovi$cohort,
+                              stroke = 1, pointsize = 1, invisible = "quali") + 
+                theme_bw() +
+                theme(text = element_text(size = 15),
+                      # plot.title = element_markdown(size = 15, hjust = 0.5, vjust = 0.5),
+                      legend.text=element_markdown(),
+                      legend.text.align = 0,
+                      panel.grid = element_blank()) +
+                scale_color_npg(name = "Batch", labels = c("<i>Lmna</i> - 1",
+                                                           "<i>Lmna</i> - 2",
+                                                           "<i>Zmpste</i> - 1",
+                                                           "<i>Zmpste</i> - 2")) +
+                scale_shape_manual(name = "Batch", values = c(21, 24, 22, 3),
+                                   labels = c("<i>Lmna</i> - 1",
+                                              "<i>Lmna</i> - 2",
+                                              "<i>Zmpste</i> - 1",
+                                              "<i>Zmpste</i> - 2")) +
+                scale_fill_npg(name = "Batch", labels = c("<i>Lmna</i> - 1",
+                                                          "<i>Lmna</i> - 2",
+                                                          "<i>Zmpste</i> - 1",
+                                                          "<i>Zmpste</i> - 2")) +
+                labs(title = plot_title,
+                     subtitle = plot_subtitle)
+            
+            g$labels$x <- stringr::str_replace(g$labels$x, "Dim", "PC")
+            g$labels$y <- stringr::str_replace(g$labels$y, "Dim", "PC")
+            
+            PCAs$raw_batch[[i]] <- g
+            names(PCAs$raw_batch)[i] <- disease_name
+            
+            
+            # Corrected
+            
+            pca <- mice_uniovi_corrected_batch_sex %>% 
+                dplyr::select(all_of(aptamers)) %>% 
+                as.matrix()
+            
+            res.pca <- prcomp(pca,  scale = TRUE)
+            
+
+            g <- fviz_pca_ind(res.pca, label="none",
+                              habillage = factor(interaction(mice_uniovi$genotype, mice_uniovi$model), levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                              fill =      factor(interaction(mice_uniovi$genotype, mice_uniovi$model), levels = c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                              stroke = 1, pointsize = 1, invisible = "quali") + 
+                theme_bw() +
+                theme(text = element_text(size = 15),
+                      # plot.title = element_markdown(size = 15, hjust = 0.5, vjust = 0.5),
+                      legend.text = element_markdown(),
+                      legend.text.align = 0,
+                      panel.grid = element_blank()) +
+                scale_color_manual(name = "Genotype",
+                                   values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO),
+                                                     c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                              "<i>Zmpste24<sup>+/+</sup></i>",
+                                              "<i>Zmpste24<sup>-/-</sup></i>")) +
+                scale_shape_manual(name = "Genotype",
+                                   values = setNames(c(22, 22, 24, 24),
+                                                     c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                              "<i>Zmpste24<sup>+/+</sup></i>",
+                                              "<i>Zmpste24<sup>-/-</sup></i>")) + 
+                scale_fill_manual(name = "Genotype",
+                                  values = setNames(c("white", colors$LakiKO, "white", colors$ZmpsteKO),
+                                                    c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                                  labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                             "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                             "<i>Zmpste24<sup>+/+</sup></i>",
+                                             "<i>Zmpste24<sup>-/-</sup></i>")) +
+                labs(title = plot_title,
+                     subtitle = plot_subtitle)
+            
+            g$labels$x <- stringr::str_replace(g$labels$x, "Dim", "PC")
+            g$labels$y <- stringr::str_replace(g$labels$y, "Dim", "PC")
+            
+            PCAs$corrected_group[[i]] <- g
+            names(PCAs$corrected_group)[i] <- disease_name
+            
+            
+            g <- fviz_pca_ind(res.pca, label="none",
+                              habillage=mice_uniovi$sex,
+                              pointsize = 1, invisible = "quali") + 
+                theme_bw() +
+                theme(text = element_text(size = 15),
+                      # plot.title = element_markdown(size = 15, hjust = 0.5, vjust = 0.5),
+                      legend.text = element_markdown(),
+                      legend.text.align = 0,
+                      panel.grid = element_blank()) +
+                labs(title = plot_title,
+                     subtitle = plot_subtitle)
+            
+            g$labels$x <- stringr::str_replace(g$labels$x, "Dim", "PC")
+            g$labels$y <- stringr::str_replace(g$labels$y, "Dim", "PC")
+            
+            PCAs$corrected_sex[[i]] <- g
+            names(PCAs$corrected_sex)[i] <- disease_name
+            
+            
+            g <- fviz_pca_ind(res.pca, label="none",
+                              habillage=mice_uniovi$cohort,
+                              fill = mice_uniovi$cohort,
+                              stroke = 1, pointsize = 1, invisible = "quali") + 
+                theme_bw() +
+                theme(text = element_text(size = 15),
+                      # plot.title = element_markdown(size = 15, hjust = 0.5, vjust = 0.5),
+                      legend.text = element_markdown(),
+                      legend.text.align = 0,
+                      panel.grid = element_blank()) +
+                scale_color_npg(name = "Batch", labels = c("<i>Lmna</i> - 1",
+                                                           "<i>Lmna</i> - 2",
+                                                           "<i>Zmpste</i> - 1",
+                                                           "<i>Zmpste</i> - 2")) +
+                scale_shape_manual(name = "Batch", values = c(21, 24, 22, 3),
+                                   labels = c("<i>Lmna</i> - 1",
+                                              "<i>Lmna</i> - 2",
+                                              "<i>Zmpste</i> - 1",
+                                              "<i>Zmpste</i> - 2")) +
+                scale_fill_npg(name = "Batch", labels = c("<i>Lmna</i> - 1",
+                                                          "<i>Lmna</i> - 2",
+                                                          "<i>Zmpste</i> - 1",
+                                                          "<i>Zmpste</i> - 2")) +
+                labs(title = plot_title,
+                     subtitle = plot_subtitle)
+            
+            g$labels$x <- stringr::str_replace(g$labels$x, "Dim", "PC")
+            g$labels$y <- stringr::str_replace(g$labels$y, "Dim", "PC")
+            
+            PCAs$corrected_batch[[i]] <- g
+            names(PCAs$corrected_batch)[i] <- disease_name
+            
+        }
+        
+    }
+    
+    return(PCAs)
+    
+}
+
+
+PCAs <- make_PCAs()
+
+
+```
+
+### Principal Components logistic regression
+
+```{r}
+
+gene_sets <- list.files(path="/home/diego/SomaScan/Disease_Ontology", pattern="*.txt", recursive=FALSE, full.names=TRUE)
+gene_sets_names <- list.files(path="/home/diego/SomaScan/Disease_Ontology", pattern="*.txt", recursive=FALSE)
+
+
+PC_logistic_regression <- function() {
+    
+    df_pvals <- data.frame("PC1"      = double(length(gene_sets)),
+                           "PC2"      = double(length(gene_sets)),
+                           "full_mod" = double(length(gene_sets))) 
+    
+    to_rm <- integer()
+    PCR.pvals <- list()
+    
+    for(i in seq_along(gene_sets)){
+        
+        df <- read.table(gene_sets[i]) %>% 
+            dplyr::rename(EntrezGeneSymbol = V1) %>% 
+            dplyr::left_join(analytes[, c("EntrezGeneSymbol", "AptName")],
+                             by = "EntrezGeneSymbol", multiple = "all") %>% 
+            dplyr::filter(!is.na(AptName))
+        
+        aptamers <- df %>% 
+            dplyr::pull(AptName)
+        genes    <- df %>% 
+            dplyr::pull(EntrezGeneSymbol) %>% 
+            unique()
+        
+        
+        if(length(aptamers) > 2) {
+            
+            print(paste0("Number of aptamers: ", length(aptamers)))
+            
+            pca <- mice_uniovi_corrected_batch_sex %>% 
+                dplyr::select(all_of(aptamers), genotype)
+
+            pca_mat <- subset(pca, select = -genotype) %>% 
+                as.matrix()
+            
+            res.pca <- prcomp(pca_mat,  scale = TRUE)
+            
+            pca_PCs_gen <- cbind(as.data.frame(res.pca$x), genotype = pca$genotype)
+            
+            glm.fit.full <- glm(genotype ~ PC1 + PC2, data = pca_PCs_gen, family = binomial)
+            
+            # glm.fit.PC1 <- glm(genotype ~ PC1, data = pca_PCs_gen, family = binomial)
+            # glm.fit.PC2 <- glm(genotype ~ PC2, data = pca_PCs_gen, family = binomial)
+            
+            glm.fit.null <- glm(genotype ~ 1, data = pca_PCs_gen, family = 'binomial') # null model
+            pval_anova <- anova(glm.fit.null, glm.fit.full, test = 'Chisq')
+
+            PCR.pvals[[i]] <- c(summary(glm.fit.full)$coefficients[, 4],
+                                setNames(pval_anova$`Pr(>Chi)`[2], "full_mod"))
+            names(PCR.pvals)[i] <- gsub(".txt", "", gene_sets_names[i])
+            
+            df_pvals[i, ] <- PCR.pvals[[i]][c("PC1", "PC2", "full_mod")]
+            rownames(df_pvals)[i] <- gsub(".txt", "", gene_sets_names[i])
+            
+            
+        } else {
+            to_rm <- c(to_rm, i)
+        }
+        
+    }
+    
+    # return(PCR.pvals[!unlist(lapply(PCR.pvals, is.null))])
+    return(df_pvals[-to_rm, ])
+
+}
+
+pcr.res <- PC_logistic_regression()
+
+
+# to filter significant results
+
+# pcr.res.signif <- list()
+# 
+# for (disease in names(pcr.res)){
+#     if (pcr.res[[disease]]["PC1"] < 0.05 || pcr.res[[disease]]["PC2"] < 0.05 ||
+#         pcr.res[[disease]]["full_mod"] < 0.05){
+#         
+#         pcr.res.signif[[disease]] <- pcr.res[[disease]]
+#     }
+# }
+
+```
+
+```{r}
+
+
+# n <- (1000-29) * 5
+# 
+# pcr_negative_controls <- data.frame("PC1"      = double(n),
+#                                     "PC2"      = double(n),
+#                                     "full_mod" = double(n),
+#                                     "size"     = double(n)) 
+
+# it <- 0
+# 
+# for (i in 30:1000) {
+#     for (j in 1:5) {
+#         
+#         it <- it + 1
+#         
+#         # print(paste0(it, "/4855"))
+#         
+#         aptamers <- sample(tab$AptName, i)
+#         
+#         pca <- mice_uniovi_corrected_batch_sex %>%
+#             dplyr::select(all_of(aptamers), genotype)
+#         
+#         pca_mat <- subset(pca, select = -genotype) %>%
+#             as.matrix()
+#         
+#         res.pca <- prcomp(pca_mat,  scale = TRUE)
+#         
+#         pca_PCs_gen <- cbind(as.data.frame(res.pca$x), genotype = pca$genotype)
+#         
+#         glm.fit.full <- glm(genotype ~ PC1 + PC2, data = pca_PCs_gen, family = binomial)
+#         
+#         
+#         glm.fit.null <- glm(genotype ~ 1, data = pca_PCs_gen, family = 'binomial') # null model
+#         pval_anova <- anova(glm.fit.null, glm.fit.full, test = 'Chisq')
+#         
+#         PCR.pvals <- c(
+#             summary(glm.fit.full)$coefficients[, 4],
+#             setNames(pval_anova$`Pr(>Chi)`[2], "full_mod"),
+#             setNames(i, "size")
+#         )
+#         
+#         pcr_negative_controls[it,] <- PCR.pvals[c("PC1", "PC2", "full_mod", "size")]
+# 
+#         
+#     }
+# }
+
+
+
+
+```
+
+```{r}
+
+# g1 <- ggplot(pcr_negative_controls, aes(size, full_mod)) +
+#     geom_point() +
+#     coord_cartesian(ylim = c(0, 0.1))
+# 
+# g2 <- ggplot(pcr_negative_controls, aes(size, PC1)) +
+#     geom_point() +
+#     coord_cartesian(ylim = c(0, 0.1))
+# 
+# g3 <- ggplot(pcr_negative_controls, aes(size, PC2)) +
+#     geom_point() +
+#     coord_cartesian(ylim = c(0, 0.1))
+
+```
+
+```{r}
+
+sX_plots <- list(PCAs$corrected_group$Arterial_disease,
+                 PCAs$corrected_group$bone_development_disease,
+                 PCAs$corrected_group$Cardiomyopathy,
+                 PCAs$corrected_group$Congestive_heart_failure,
+                 PCAs$corrected_group$lipodystrophy,
+                 PCAs$corrected_group$osteoarthritis,
+                 PCAs$corrected_group$muscular_atrophy)
+
+sX_legend <- get_legend(sX_plots[[1]])
+
+sX_plots <- lapply(sX_plots, \(x) x + theme(axis.text = element_text(size = 8),
+                                            axis.title = element_text(size = 8),
+                                            legend.text = element_markdown(size = 8),
+                                            legend.text.align = 0,
+                                            plot.title = element_markdown(size = 10, margin = margin(t = 2, b = 2)),
+                                            plot.subtitle = element_text(size = 8, margin = margin(t = 2, b = 2)),
+                                            plot.margin = margin(t = 2, r = 10, b = 2, l = 10),
+                                            legend.position = "none"))
+
+
+annotate_PCA <- function(plot, set_name) {
+    
+    set_name <- plot$labels$title
+    
+    my_formatC <- formatC
+    formals(my_formatC)$format <- "e"
+    formals(my_formatC)$digits <- 2
+    formatted_pvals <- lapply(pcr.res[set_name, ], my_formatC)
+    
+    my_label <- sprintf("<i>P</i> = %.2e (PC1: %.4f, PC2: %.4f)", pcr.res[set_name, "full_mod"], pcr.res[set_name, "PC1"], pcr.res[set_name, "PC2"])
+
+        
+    ann_plot <- plot +
+        annotate("richtext", label = my_label, label.padding = unit(0.15, "lines"), x = min(plot$data$x), y = 1.3 * max(plot$data$y),
+                 size = 8/ggplot2::.pt, hjust = 0, vjust = 0) +
+        scale_y_continuous(expand = expansion(mult = c(0.1, 0.25)))
+    
+    
+    return(ann_plot)
+}
+
+sX_plots <- lapply(sX_plots, annotate_PCA)
+
+sX_plots$legend <- as.ggplot(sX_legend)
+
+sX <- ggarrange(plotlist = sX_plots, ncol = 2, nrow = 4, align = "hv",
+                labels = c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)"), hjust = 0)
+                   
+ggsave("sX.pdf", plot = sX, device = "pdf", path = "figures/", height = 220, width = 180, units = "mm")
+
+
+```
+
+```{r}
+negative_controls_plots <- list(PCAs$corrected_group$congenitalnervoussystemabnormality,
+                                PCAs$corrected_group$neuraltubedefect,
+                                PCAs$corrected_group$visceralheterotaxy,
+                                PCAs$corrected_group$orofacialcleft,
+                                PCAs$corrected_group$congenitalhemolyticanemia,
+                                PCAs$corrected_group$congenitalhypothyroidism)
+
+
+
+negative_controls_legend <- get_legend(negative_controls_plots[[1]])
+
+negative_controls_plots <- lapply(negative_controls_plots, \(x) x + theme(axis.text = element_text(size = 8),
+                                                                          axis.title = element_text(size = 8),
+                                                                          legend.text = element_markdown(size = 8),
+                                                                          legend.text.align = 0,
+                                                                          plot.title = element_markdown(size = 10, margin = margin(t = 2, b = 2)),
+                                                                          plot.subtitle = element_text(size = 8, margin = margin(t = 2, b = 2)),
+                                                                          plot.margin = margin(t = 2, r = 10, b = 2, l = 10),
+                                                                          legend.position = "none"))
+
+negative_controls_plots <- lapply(negative_controls_plots, annotate_PCA)
+
+negative_controls <- ggarrange(plotlist = negative_controls_plots, ncol = 2, nrow = 3, align = "hv",
+                               labels = c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)"), hjust = 0, common.legend = TRUE)
+
+ggsave("negative_controls_DO.pdf", plot = negative_controls, device = "pdf", path = "figures/", height = 220, width = 180, units = "mm")
+
+```
+
+### Boxplots cardiovascular
+
+```{r}
+boxplot_genes <- read_excel("cardiac_disease_genes.xlsx")
+
+
+ann_data_pos <- mice_uniovi %>% 
+              dplyr::select(all_of(boxplot_genes$AptName), "model") %>% 
+              tidyr::pivot_longer(cols = all_of(boxplot_genes$AptName), names_to = "AptName") %>% 
+              dplyr::group_by(model, AptName) %>% 
+              dplyr::mutate(y.position = max(value)) %>% 
+              dplyr::group_by(AptName) %>% 
+              dplyr::mutate(rg = max(value) - min(value)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::select(-value) %>% 
+              dplyr::distinct(model, AptName, .keep_all = TRUE)
+              
+  
+ann_data_label <- tab %>% 
+                   dplyr::select(AptName, P.value.adj.LAKI_KOvWT, P.value.adj.ZMPSTE_KOvWT, EntrezGeneSymbol) %>% 
+                   dplyr::filter(AptName %in% boxplot_genes$AptName) %>% 
+                   dplyr::rename(laki = P.value.adj.LAKI_KOvWT, zmpste = P.value.adj.ZMPSTE_KOvWT) %>% 
+                   tidyr::pivot_longer(cols = all_of(c("laki", "zmpste")), names_to = "model", values_to = "p.value.adj") %>% 
+                   dplyr::mutate(model = factor(model, levels = c("laki", "zmpste")),
+                                 lab = dplyr::case_when(p.value.adj <  0.0001 ~ "****",
+                                                        p.value.adj <  0.001  ~ "***",
+                                                        p.value.adj <  0.01   ~ "**",
+                                                        p.value.adj <= 0.05   ~ "*",
+                                                        p.value.adj >  0.05   ~ "ns"))
+
+ann_data <- dplyr::full_join(ann_data_pos, ann_data_label, by = join_by(model, AptName))
+
+ann_data <- xy_position(ann_data, max_y = "y.position", group_by = "model", range = "rg")
+
+
+
+f4a <- mice_uniovi %>%
+  dplyr::select(all_of(boxplot_genes$AptName), "genotype", "model") %>%
+  tidyr::pivot_longer(boxplot_genes$AptName, names_to = "AptName") %>%
+  dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::mutate(genotype.model = interaction(genotype, model)) %>% 
+  ggplot(aes(model, value)) +
+  geom_boxplot(aes(color = genotype.model, fill = genotype.model, shape = genotype.model), outlier.shape = NA, alpha = 0.2) +
+  geom_point(aes(color = genotype.model, fill = genotype.model, shape = genotype.model), stroke = 0.7, size = 0.8, position = position_jitterdodge(jitter.width = 0.5)) +
+  scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_color_manual(values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_fill_manual(values = setNames(c("white", colors$LakiKO, "white", colors$ZmpsteKO), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                              "<i>Zmpste24<sup>+/+</sup></i>",
+                              "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_x_discrete(labels = c("<i>Lmna</i>", "<i>Zmpste24</i>")) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.25))) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free", nrow = 2) +
+  geom_text(data = ann_data, aes(x = xlab,  y = ylab, label = lab), hjust = 0.5, vjust = 0, size = 8/ggplot2::.pt) +
+  geom_segment(data = ann_data, aes(x = x1, xend = x1, y = y1, yend = y2), colour = "black") +
+  geom_segment(data = ann_data, aes(x = x2, xend = x2, y = y1, yend = y2), colour = "black") +
+  geom_segment(data = ann_data, aes(x = x1, xend = x2, y = y2, yend = y2), colour = "black") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size = 10),
+        axis.ticks.x = element_blank(),
+        legend.position = "bottom",
+        legend.text = element_markdown(size = 10, face = "bold", margin = margin(r = 20, unit = "pt")),
+        legend.title = element_blank(),
+        strip.text = element_text(size = 8, face = "bold"))
+
+```
+
+
+```{r}
+
+f4 <- ggarrange(f4a + theme(legend.position = "none"),
+                get_legend(postn$plot),
+                ggarrange(NULL, postn$plot + theme(legend.position = "none"), NULL, nrow = 1, widths = c(0.1, 0.4, 0.5)),
+                nrow = 3, labels = c("(a)", "", "(b)"), heights = c(47.5, 5, 47.5), hjust = 0)
+
+ggsave("f4.pdf", plot = f4, device = "pdf", path = "figures/", width = 180, height = 128.9, units = "mm")
+
+f4_named <- f4 + theme(plot.margin = margin(t = 20, unit = "mm"))
+
+f4_named <- annotate_figure(f4_named, fig.lab = "Figure 4", fig.lab.size = 25)
+
+ggsave("f4_named.pdf", plot = f4_named, device = "pdf", path = "figures/", width = 180, height = 128.9 + 20, units = "mm")
+```
+
+
+### Boxplots bone
+
+```{r}
+boxplot_genes <- read_excel("biomarkers.xlsx", sheet = "bone")
+
+
+g <- mice_uniovi %>%
+  dplyr::select(all_of(c(boxplot_genes$AptName, "genotype", "model"))) %>%
+  pivot_longer(boxplot_genes$AptName, names_to = "AptName") %>%
+  left_join(boxplot_genes) %>%
+  dplyr::mutate(genotype.model = interaction(genotype, model)) %>% 
+  ggplot(aes(model, value, color = genotype.model, fill = genotype.model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.2) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  scale_color_manual(values = c("WT.zmpste" = colors$ZmpsteWT, "KO.zmpste" = colors$ZmpsteKO,
+                                "WT.laki" = colors$LakiWT, "KO.laki" = colors$LakiKO),
+                     labels = c("<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>",
+                                "<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>")) +
+  scale_fill_manual(values = c("WT.zmpste" = colors$ZmpsteWT, "KO.zmpste" = colors$ZmpsteKO,
+                                "WT.laki" = colors$LakiWT, "KO.laki" = colors$LakiKO),
+                   labels = c("<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>",
+                                "<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>")) +
+  scale_x_discrete(labels = c("<i>Zmpste24</i>", "<i>Lmna</i>")) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free", nrow = 2) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_markdown(),
+        legend.position = "bottom",
+        text = element_text(size = 12.5),
+        legend.text=element_markdown(size=15),
+        legend.title = element_blank())
+```
+
+### Boxplots muscle
+
+```{r}
+boxplot_genes <- read_excel("biomarkers.xlsx", sheet = "muscle")
+
+
+g <- mice_uniovi %>%
+  dplyr::select(all_of(c(boxplot_genes$AptName, "genotype", "model"))) %>%
+  pivot_longer(boxplot_genes$AptName, names_to = "AptName") %>%
+  left_join(boxplot_genes) %>%
+  dplyr::mutate(genotype.model = interaction(genotype, model)) %>% 
+  ggplot(aes(model, value, color = genotype.model, fill = genotype.model)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.2) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  scale_color_manual(values = c("WT.zmpste" = colors$ZmpsteWT, "KO.zmpste" = colors$ZmpsteKO,
+                                "WT.laki" = colors$LakiWT, "KO.laki" = colors$LakiKO),
+                     labels = c("<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>",
+                                "<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>")) +
+  scale_fill_manual(values = c("WT.zmpste" = colors$ZmpsteWT, "KO.zmpste" = colors$ZmpsteKO,
+                                "WT.laki" = colors$LakiWT, "KO.laki" = colors$LakiKO),
+                   labels = c("<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>",
+                                "<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>")) +
+  scale_x_discrete(labels = c("<i>Zmpste24</i>", "<i>Lmna</i>")) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  facet_wrap(~EntrezGeneSymbol, scales = "free", nrow = 2) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_markdown(),
+        legend.position = "bottom",
+        text = element_text(size = 12.5),
+        legend.text=element_markdown(size=15),
+        legend.title = element_blank())
+```
+
+### Gene set enrichment analysis (GSEA): LAKI WT vs. KO
+
+```{r}
+tmp <- tab %>% 
+  dplyr::arrange(desc(t.LAKI_KOvWT)) %>% 
+  dplyr::filter(EntrezGeneID != "",
+                !duplicated(.$EntrezGeneID)) # retain only 1st ocurrence of each ID
+
+#######################################################
+# tmp generated used in a separate GSEA analysis script
+#######################################################
+
+```
+
+### Gene set enrichment analysis (GSEA): FACE WT vs. KO
+
+```{r}
+tmp <- tab %>% 
+  dplyr::arrange(desc(t.ZMPSTE_KOvWT)) %>% 
+  dplyr::filter(EntrezGeneID != "",
+                !duplicated(.$EntrezGeneID)) # retain only 1st ocurrence of each ID
+
+#######################################################
+# tmp generated used in a separate GSEA analysis script
+#######################################################
+
+```
+
+### Tables
+
+```{r}
+t1 <- tab %>% 
+       dplyr::arrange(P.value.adj.KOvWT) %>% 
+       dplyr::select(UniProt, AptName, EntrezGeneSymbol, Coef.KOvWT, P.value.adj.KOvWT) %>% 
+       dplyr::mutate(across(Coef.KOvWT, ~ round(., 2)),
+                     across(P.value.adj.KOvWT,
+                            ~ formatC(., format = "E", digits = 2))) %>% 
+       dplyr::rename("UniProt ID" = UniProt,
+                     "Gene symbol" = EntrezGeneSymbol,
+                     "log\u2082FC" = Coef.KOvWT,
+                     FDR = P.value.adj.KOvWT) %>% 
+       head(10)
+
+write.xlsx(t1, "tables/t1.xlsx")
+
+t2a <- tab %>% 
+       dplyr::arrange(P.value.adj.LAKI_KOvWT) %>% 
+       dplyr::select(UniProt, AptName, EntrezGeneSymbol, Coef.LAKI_KOvWT, P.value.adj.LAKI_KOvWT) %>% 
+       dplyr::mutate(across(Coef.LAKI_KOvWT, ~ round(., 2)),
+                     across(P.value.adj.LAKI_KOvWT, ~ formatC(., format = "E", digits = 2))) %>%     
+       dplyr::rename("UniProt ID" = UniProt,
+                     "Gene symbol" = EntrezGeneSymbol,
+                     "log\u2082FC" = Coef.LAKI_KOvWT,
+                     "FDR" = P.value.adj.LAKI_KOvWT) %>% 
+       head(10)
+
+write.xlsx(t2a, "tables/t2a.xlsx")
+
+
+t2b <- tab %>% 
+       dplyr::arrange(P.value.adj.ZMPSTE_KOvWT) %>% 
+       dplyr::select(UniProt, AptName, EntrezGeneSymbol, Coef.ZMPSTE_KOvWT, P.value.adj.ZMPSTE_KOvWT) %>% 
+       dplyr::mutate(across(Coef.ZMPSTE_KOvWT, ~ round(., 2)),
+                     across(P.value.adj.ZMPSTE_KOvWT, ~ formatC(., format = "E", digits = 2))) %>% 
+       dplyr::rename("UniProt ID" = UniProt,
+                     "Gene symbol" = EntrezGeneSymbol,
+                     "log\u2082FC" = Coef.ZMPSTE_KOvWT,
+                     "FDR" = P.value.adj.ZMPSTE_KOvWT) %>% 
+       head(10)
+
+write.xlsx(t2b, "tables/t2b.xlsx")
+
+
+top10both <- union(t2a$AptName, t2b$AptName)
+
+t2 <- tab %>% 
+       dplyr::filter(AptName %in% top10both) %>% 
+       dplyr::select(UniProt, AptName, EntrezGeneSymbol, Coef.LAKI_KOvWT, Coef.ZMPSTE_KOvWT,
+                     P.value.adj.LAKI_KOvWT, P.value.adj.ZMPSTE_KOvWT) %>% 
+       dplyr::mutate(across(Coef.LAKI_KOvWT:Coef.ZMPSTE_KOvWT, ~ round(., 2)),
+                     across(P.value.adj.LAKI_KOvWT:P.value.adj.ZMPSTE_KOvWT,
+                            ~ formatC(., format = "E", digits = 2))) %>% 
+       dplyr::rename("UniProt ID" = UniProt,
+                     "Gene symbol" = EntrezGeneSymbol,
+                     "\U1D43F\U1D45A\U1D45B\U1D44E log\u2082FC" = Coef.LAKI_KOvWT,
+                     "\U1D44D\U1D45A\U1D45D\U1D460\U1D461\U1D452 log\u2082FC" = Coef.ZMPSTE_KOvWT,
+                     "\U1D43F\U1D45A\U1D45B\U1D44E FDR" = P.value.adj.LAKI_KOvWT,
+                     "\U1D44D\U1D45A\U1D45D\U1D460\U1D461\U1D452 FDR" = P.value.adj.ZMPSTE_KOvWT)
+
+write.xlsx(t2, "tables/t2.xlsx")
+```
+
+```{r}
+saveWorkbook(OUT, "results.xlsx", overwrite = TRUE) # Write the excel file
+```
+
+```{r}
+f5 <- readRDS("f5.rds")
+
+ggsave("f5.pdf", plot = f5, device = "pdf", path = "figures/", width = 180, height = 120, units = "mm")
+
+f5_named <- f5 + theme(plot.margin = margin(t = 20, unit = "mm"))
+
+f5_named <- annotate_figure(f5_named, fig.lab = "Figure 5", fig.lab.size = 25)
+
+ggsave("f5_named.pdf", plot = f5_named, device = "pdf", path = "figures/", width = 180, height = 120 + 20, units = "mm")
+
+```
+
+
+## Others
+
+```{r}
+ACBP <- mice_uniovi %>%
+  dplyr::select("seq.16919.1", "genotype", "model") %>%
+  tidyr::pivot_longer("seq.16919.1", names_to = "AptName") %>%
+  dplyr::left_join(analytes[c("AptName", "EntrezGeneSymbol")], by = "AptName") %>%
+  dplyr::mutate(genotype.model = interaction(genotype, model)) %>% 
+  ggplot(aes(model, value)) +
+  geom_boxplot(aes(color = genotype.model, fill = genotype.model, shape = genotype.model), outlier.shape = NA, alpha = 0.2) +
+  geom_point(aes(color = genotype.model, fill = genotype.model, shape = genotype.model), stroke = 0.7, size = 0.8, position = position_jitterdodge(jitter.width = 0.5)) +
+  scale_shape_manual(values = setNames(c(1, 19, 1, 19), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_color_manual(values = setNames(c(colors$LakiWT, colors$LakiKO, colors$ZmpsteWT, colors$ZmpsteKO), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                     labels = c("<i>Lmna<sup>+/+</sup></i>",
+                                "<i>Lmna<sup>G609G/G609G</sup></i>",
+                                "<i>Zmpste24<sup>+/+</sup></i>",
+                                "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_fill_manual(values = setNames(c("white", colors$LakiKO, "white", colors$ZmpsteKO), c("WT.laki", "KO.laki", "WT.zmpste", "KO.zmpste")),
+                   labels = c("<i>Lmna<sup>+/+</sup></i>",
+                              "<i>Lmna<sup>G609G/G609G</sup></i>",
+                              "<i>Zmpste24<sup>+/+</sup></i>",
+                              "<i>Zmpste24<sup>-/-</sup></i>")) +
+  scale_x_discrete(labels = c("<i>Lmna</i>", "<i>Zmpste24</i>")) +
+  scale_y_continuous(limits = c(8, 10)) +
+  theme_classic() +
+  ylab(expression(log[2]*RFU)) +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 10),
+        axis.text.x = element_blank(),
+        legend.position = "bottom",
+        # text = element_text(size = 12.5),
+        legend.text = element_markdown(size = 10),
+        legend.title = element_blank())
+
+ggsave("ACBP.tiff", plot = ACBP, device = "tiff", path = "figures/", width = 150, height = 80, units = "mm")
+
+```
+
+```{r}
+
+log2FC_WTvsKO <- tab %>% 
+                    dplyr::filter(P.value.adj.KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.KOvWT) %>% 
+                    range()
+
+log2FC_LAKI <- tab %>% 
+                    dplyr::filter(P.value.adj.LAKI_KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.LAKI_KOvWT) %>% 
+                    range()
+
+log2FC_FACE <- tab %>% 
+                    dplyr::filter(P.value.adj.ZMPSTE_KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.ZMPSTE_KOvWT) %>% 
+                    range()
+
+# Log2FC
+sprintf("Log2FC in the WT vs KO comparison ranges from %.2f to %.2f", log2FC_WTvsKO[1], log2FC_WTvsKO[2])
+sprintf("Log2FC in LAKI ranges from %.2f to %.2f", log2FC_LAKI[1], log2FC_LAKI[2])
+sprintf("Log2FC in FACE ranges from %.2f to %.2f", log2FC_FACE[1], log2FC_FACE[2])
+
+# FC
+sprintf("FC in the WT vs KO comparison ranges from %.2f to %.2f", 2^log2FC_WTvsKO[1], 2^log2FC_WTvsKO[2])
+sprintf("FC in LAKI ranges from %.2f to %.2f", 2^log2FC_LAKI[1], 2^log2FC_LAKI[2])
+sprintf("FC in FACE ranges from %.2f to %.2f", 2^log2FC_FACE[1], 2^log2FC_FACE[2])
+
+# % change
+sprintf("Changes in the WT vs KO comparison range from %.2f %% to %.2f %%", 2^log2FC_WTvsKO[1] * 100, 2^log2FC_WTvsKO[2] * 100)
+sprintf("Changes in LAKI range from %.2f %% to %.2f %%", 2^log2FC_LAKI[1] * 100, 2^log2FC_LAKI[2] * 100)
+sprintf("Changes in FACE range from %.2f %% to %.2f %%", 2^log2FC_FACE[1] * 100, 2^log2FC_FACE[2] * 100)
+
+
+
+```
+
+```{r}
+
+log2FC_WTvsKO <- tab %>% 
+                    dplyr::filter(P.value.adj.KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.KOvWT) %>% 
+                    abs() %>% 
+                    range()
+
+log2FC_LAKI <- tab %>% 
+                    dplyr::filter(P.value.adj.LAKI_KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.LAKI_KOvWT) %>% 
+                    abs() %>%
+                    range()
+
+log2FC_FACE <- tab %>% 
+                    dplyr::filter(P.value.adj.ZMPSTE_KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.ZMPSTE_KOvWT) %>% 
+                    abs() %>%
+                    range()
+
+
+# % change (ignoring direction of change)
+sprintf("Changes in the WT vs KO comparison range from %.2f %% to %.2f %%", 2^log2FC_WTvsKO[1] * 100, 2^log2FC_WTvsKO[2] * 100)
+sprintf("Changes in LAKI range from %.2f %% to %.2f %%", 2^log2FC_LAKI[1] * 100, 2^log2FC_LAKI[2] * 100)
+sprintf("Changes in FACE range from %.2f %% to %.2f %%", 2^log2FC_FACE[1] * 100, 2^log2FC_FACE[2] * 100)
+
+```
+
+```{r}
+
+log2FC_WTvsKO <- tab %>% 
+                    dplyr::filter(P.value.adj.KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.KOvWT) %>% 
+                    abs()
+
+percent_change_WTvsKO <- 2^log2FC_WTvsKO * 100 - 100
+
+
+log2FC_LAKI <- tab %>% 
+                    dplyr::filter(P.value.adj.LAKI_KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.LAKI_KOvWT) %>% 
+                    abs()
+
+percent_change_LAKI <- 2^log2FC_LAKI * 100 - 100
+
+log2FC_FACE <- tab %>% 
+                    dplyr::filter(P.value.adj.ZMPSTE_KOvWT <= 0.05) %>% 
+                    dplyr::pull(Coef.ZMPSTE_KOvWT) %>% 
+                    abs()
+
+percent_change_FACE <- 2^log2FC_FACE * 100 - 100
+
+quantile(percent_change_WTvsKO)
+quantile(percent_change_LAKI)
+quantile(percent_change_FACE)
+
+```
